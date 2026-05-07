@@ -70,6 +70,7 @@ type ServerState = {
 
 type Lease = {
 	managedBy: string;
+	usesDs4: true;
 	pid: number;
 	cwd: string;
 	startedAt: number;
@@ -88,6 +89,7 @@ let startupPromise: Promise<void> | undefined;
 let activeSetupChild: ChildProcess | undefined;
 let resolvedRuntimeDir: string | undefined;
 let leaseStartedAt = Date.now();
+let leaseActive = false;
 let runtimeDisposed = false;
 let shuttingDown = false;
 let writeSeq = 0;
@@ -552,6 +554,7 @@ async function touchLease(): Promise<void> {
 	const now = Date.now();
 	const lease: Lease = {
 		managedBy: MANAGED_BY,
+		usesDs4: true,
 		pid: process.pid,
 		cwd: process.cwd(),
 		startedAt: leaseStartedAt,
@@ -587,7 +590,8 @@ async function pruneLeases(): Promise<void> {
 		const [lease, info] = await Promise.all([readJson<Lease>(file), stat(file).catch(() => undefined)]);
 		const staleByAge = !info || now - info.mtimeMs > LEASE_TTL_MS;
 		const staleByPid = !isPidAlive(lease?.pid);
-		if (staleByAge || staleByPid) await removeFile(file);
+		const staleByVersion = lease?.managedBy !== MANAGED_BY || lease?.usesDs4 !== true;
+		if (staleByAge || staleByPid || staleByVersion) await removeFile(file);
 	}
 }
 
@@ -600,12 +604,23 @@ async function activeLeaseCount(): Promise<number> {
 async function activateLease(): Promise<void> {
 	await ensureDirs();
 	await touchLease();
+	leaseActive = true;
 	await pruneLeases();
 	startHeartbeat();
 }
 
+async function ownLeaseExists(): Promise<boolean> {
+	try {
+		await stat(LEASE_FILE);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 async function removeOwnLease(): Promise<void> {
 	await removeFile(LEASE_FILE);
+	leaseActive = false;
 }
 
 async function readState(): Promise<ServerState | undefined> {
@@ -879,6 +894,7 @@ export default function (pi: ExtensionAPI) {
 	runtimeDisposed = false;
 	shuttingDown = false;
 	leaseStartedAt = Date.now();
+	leaseActive = false;
 	startupPromise = undefined;
 	activeSetupChild = undefined;
 	resolvedRuntimeDir = undefined;
@@ -886,30 +902,28 @@ export default function (pi: ExtensionAPI) {
 	registerDs4Provider(pi);
 	registerDs4Command(pi);
 
-	pi.on("session_start", (_event, ctx) => {
-		const setStatus = (message: string | undefined) => {
-			if (ctx.hasUI) ctx.ui.setStatus("ds4", message);
-		};
-
-		setStatus("ds4 starting");
-		void ensureServerManaged(setStatus)
-			.then(() => setStatus(undefined))
-			.catch((error) => {
-				if (runtimeDisposed) return;
-				setStatus("ds4 error");
-				ctx.ui.notify(`ds4-server startup failed: ${describeError(error)}`, "error");
-			});
-	});
-
 	pi.on("before_provider_request", async (_event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER_ID || ctx.model?.id !== MODEL_ID) return;
-		const setStatus = (message: string | undefined) => {
-			if (ctx.hasUI) ctx.ui.setStatus("ds4", message);
-		};
 
-		setStatus("ds4 starting");
-		await ensureServerManaged(setStatus);
-		setStatus(undefined);
+		const alreadyReady = await checkHttpReady();
+		let lastNotification: string | undefined;
+		const notifyStatus: StatusCallback | undefined = alreadyReady
+			? undefined
+			: (message) => {
+					if (!message || message === lastNotification) return;
+					if (/^ds4-server starting \(\d+s\)$/.test(message)) return;
+					lastNotification = message;
+					ctx.ui.notify(message, "info");
+				};
+
+		try {
+			notifyStatus?.("preparing ds4-server");
+			await ensureServerManaged(notifyStatus);
+			if (!alreadyReady) ctx.ui.notify("ds4-server ready", "info");
+		} catch (error) {
+			ctx.ui.notify(`ds4-server startup failed: ${describeError(error)}`, "error");
+			throw error;
+		}
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
@@ -924,6 +938,7 @@ export default function (pi: ExtensionAPI) {
 		// Session switches and /reload immediately create another extension instance
 		// in the same pi process. Keep the lease for those hand-offs.
 		if (event.reason !== "quit") return;
+		if (!leaseActive && !(await ownLeaseExists())) return;
 
 		shuttingDown = true;
 		try {
