@@ -597,8 +597,15 @@ function createProgressReporter(prefix: string, onStatus?: StatusCallback) {
 			start = i + 1;
 		}
 		lineBuffer += text.slice(start);
+
+		// Some progress renderers (notably tqdm / huggingface-cli) write "\r" before
+		// the replacement text instead of after it.  If we wait for the next CR we are
+		// always one update behind, and if no next update arrives the UI is stuck on
+		// the previous human line ("Downloading ...").  Treat the current unterminated
+		// buffer as the latest progress too, but keep buffering it for the final line.
+		if (lineBuffer) processLine(lineBuffer);
+
 		if (lineBuffer.length > 4096) {
-			processLine(lineBuffer);
 			lineBuffer = "";
 		}
 	};

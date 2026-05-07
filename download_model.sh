@@ -109,9 +109,9 @@ download_one() {
     echo "from https://huggingface.co/$REPO"
 
     if [ -n "$TOKEN" ]; then
-        curl -fL -C - -H "Authorization: Bearer $TOKEN" -o "$part" "$url"
+        curl -fL --progress-meter -C - -H "Authorization: Bearer $TOKEN" -o "$part" "$url"
     else
-        curl -fL -C - -o "$part" "$url"
+        curl -fL --progress-meter -C - -o "$part" "$url"
     fi
 
     mv "$part" "$out"
