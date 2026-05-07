@@ -1,0 +1,935 @@
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { closeSync, constants, openSync } from "node:fs";
+import {
+	access,
+	appendFile,
+	mkdir,
+	readdir,
+	open as openFile,
+	readFile,
+	realpath,
+	rename,
+	rm,
+	stat,
+	unlink,
+	writeFile,
+} from "node:fs/promises";
+import { homedir, totalmem } from "node:os";
+import { dirname, join, resolve } from "node:path";
+
+const PROVIDER_ID = "ds4";
+const MODEL_ID = "deepseek-v4-flash";
+const MANAGED_BY = "pi-sd4-provider";
+
+const DS4_DIR = join(homedir(), ".pi", "ds4");
+const KV_DIR = join(DS4_DIR, "kv");
+const SUPPORT_DIR = join(DS4_DIR, "support");
+const CLIENT_DIR = join(DS4_DIR, "clients");
+const LOCK_DIR = join(DS4_DIR, "lock");
+const STATE_FILE = join(DS4_DIR, "server.json");
+const LOG_FILE = join(DS4_DIR, "log");
+const LEASE_FILE = join(CLIENT_DIR, `${process.pid}.json`);
+
+const SUPPORT_REPO = process.env.DS4_SUPPORT_REPO ?? "https://github.com/mitsuhiko/ds4.git";
+const SUPPORT_BRANCH = process.env.DS4_SUPPORT_BRANCH ?? "pi-polish";
+
+const BASE_URL = "http://127.0.0.1:8000";
+const API_BASE_URL = `${BASE_URL}/v1`;
+const SERVER_ARGS = ["--ctx", "100000", "--kv-disk-dir", KV_DIR, "--kv-disk-space-mb", "8192"];
+
+const HEARTBEAT_MS = 30_000;
+const LEASE_TTL_MS = 5 * 60_000;
+const LOCK_STALE_MS = 60_000;
+const LOCK_TIMEOUT_MS = 30_000;
+const SHUTDOWN_LOCK_TIMEOUT_MS = 2_000;
+const STARTUP_LOCK_TIMEOUT_MS = 24 * 60 * 60_000;
+const READY_TIMEOUT_MS = Number(process.env.DS4_READY_TIMEOUT_MS ?? 10 * 60_000);
+const HTTP_CHECK_TIMEOUT_MS = 1_500;
+const SHUTDOWN_GRACE_MS = 60_000;
+const LOG_TAIL_BYTES = 256 * 1024;
+const LOG_MAX_LINES = 2_000;
+const LOG_POLL_MS = 1_000;
+
+type ModelQuant = "q2" | "q4";
+
+type ServerState = {
+	managedBy: string;
+	pid: number;
+	baseUrl: string;
+	cwd: string;
+	binary: string;
+	args: string[];
+	startedAt: number;
+	startedAtIso: string;
+	stopping?: boolean;
+	stoppingAt?: number;
+	stoppingAtIso?: string;
+};
+
+type Lease = {
+	managedBy: string;
+	pid: number;
+	cwd: string;
+	startedAt: number;
+	updatedAt: number;
+	updatedAtIso: string;
+};
+
+type StatusCallback = (message: string | undefined) => void;
+
+type LogTui = { terminal: { rows: number }; requestRender: (force?: boolean) => void };
+type LogTheme = { fg: (color: string, text: string) => string };
+type Component = { render(width: number): string[]; handleInput?(data: string): void; invalidate(): void };
+
+let heartbeat: ReturnType<typeof setInterval> | undefined;
+let startupPromise: Promise<void> | undefined;
+let activeSetupChild: ChildProcess | undefined;
+let resolvedRuntimeDir: string | undefined;
+let leaseStartedAt = Date.now();
+let runtimeDisposed = false;
+let shuttingDown = false;
+let writeSeq = 0;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function describeError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function isLockTimeout(error: unknown): boolean {
+	return describeError(error).includes("Timed out waiting for ds4 lifecycle lock");
+}
+
+function isPidAlive(pid: unknown): pid is number {
+	if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error: any) {
+		return error?.code === "EPERM";
+	}
+}
+
+function shellQuote(value: string): string {
+	return /^[A-Za-z0-9_./:=+-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function isKey(data: string, key: "escape" | "up" | "down" | "home" | "end" | "pageUp" | "pageDown"): boolean {
+	switch (key) {
+		case "escape":
+			return data === "\x1b";
+		case "up":
+			return data === "\x1b[A" || data === "\x1bOA";
+		case "down":
+			return data === "\x1b[B" || data === "\x1bOB";
+		case "home":
+			return data === "\x1b[H" || data === "\x1bOH" || data === "\x1b[1~";
+		case "end":
+			return data === "\x1b[F" || data === "\x1bOF" || data === "\x1b[4~";
+		case "pageUp":
+			return data === "\x1b[5~";
+		case "pageDown":
+			return data === "\x1b[6~";
+	}
+}
+
+const ANSI_RE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|_[^\x07]*(?:\x07|\x1b\\))/g;
+
+function stripAnsi(value: string): string {
+	return value.replace(ANSI_RE, "");
+}
+
+function truncateText(value: string, width: number, ellipsis = "", pad = false): string {
+	if (width <= 0) return "";
+	let text = stripAnsi(value);
+	if (text.length > width) {
+		const suffix = ellipsis.length < width ? ellipsis : "";
+		text = text.slice(0, width - suffix.length) + suffix;
+	}
+	return pad ? text + " ".repeat(Math.max(0, width - text.length)) : text;
+}
+
+function selectedModelQuant(): ModelQuant {
+	const forced = process.env.DS4_MODEL_QUANT?.toLowerCase();
+	if (forced === "q2" || forced === "q4") return forced;
+	if (forced) throw new Error(`Invalid DS4_MODEL_QUANT=${forced}; expected q2 or q4`);
+
+	const ramGb = totalmem() / 1_000_000_000;
+	if (ramGb >= 256) return "q4";
+	if (ramGb >= 128) return "q2";
+	throw new Error(
+		`DeepSeek V4 Flash requires at least 128 GB RAM for the q2 model; detected ${ramGb.toFixed(1)} GB`,
+	);
+}
+
+async function ensureDirs(): Promise<void> {
+	await mkdir(CLIENT_DIR, { recursive: true });
+	await mkdir(KV_DIR, { recursive: true });
+}
+
+async function readJson<T>(file: string): Promise<T | undefined> {
+	try {
+		return JSON.parse(await readFile(file, "utf8")) as T;
+	} catch {
+		return undefined;
+	}
+}
+
+async function writeJsonAtomic(file: string, data: unknown): Promise<void> {
+	await mkdir(dirname(file), { recursive: true });
+	const tmp = `${file}.${process.pid}.${Date.now()}.${++writeSeq}.tmp`;
+	await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+	await rename(tmp, file);
+}
+
+async function removeFile(file: string): Promise<void> {
+	try {
+		await unlink(file);
+	} catch (error: any) {
+		if (error?.code !== "ENOENT") throw error;
+	}
+}
+
+async function appendLog(text: string): Promise<void> {
+	await mkdir(DS4_DIR, { recursive: true });
+	await appendFile(LOG_FILE, text, "utf8");
+}
+
+function formatBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+	return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function readLogTail(): Promise<string[]> {
+	try {
+		const info = await stat(LOG_FILE);
+		if (!info.isFile()) return [`${LOG_FILE} exists but is not a file`];
+
+		const bytes = Math.min(info.size, LOG_TAIL_BYTES);
+		const buffer = Buffer.alloc(bytes);
+		const file = await openFile(LOG_FILE, "r");
+		try {
+			await file.read(buffer, 0, bytes, info.size - bytes);
+		} finally {
+			await file.close();
+		}
+
+		let text = stripAnsi(buffer.toString("utf8")).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+		if (info.size > bytes) {
+			const firstNewline = text.indexOf("\n");
+			if (firstNewline >= 0) text = text.slice(firstNewline + 1);
+			text = `[showing last ${formatBytes(bytes)} of ${formatBytes(info.size)} from ${LOG_FILE}]\n${text}`;
+		}
+
+		const lines = text.split("\n");
+		if (lines.at(-1) === "") lines.pop();
+		return lines.slice(-LOG_MAX_LINES);
+	} catch (error: any) {
+		if (error?.code === "ENOENT") return [`No ds4 log yet: ${LOG_FILE}`];
+		return [`Failed to read ${LOG_FILE}: ${describeError(error)}`];
+	}
+}
+
+class Ds4LogViewer implements Component {
+	private lines: string[] = [];
+	private scrollFromBottom = 0;
+	private timer: ReturnType<typeof setInterval> | undefined;
+	private version = 0;
+	private cachedWidth = 0;
+	private cachedRows = 0;
+	private cachedVersion = -1;
+	private cachedScroll = -1;
+	private cachedLines: string[] = [];
+
+	constructor(
+		private tui: LogTui,
+		private theme: LogTheme,
+		private done: () => void,
+	) {
+		void this.refresh();
+		this.timer = setInterval(() => void this.refresh(), LOG_POLL_MS);
+		this.timer.unref?.();
+	}
+
+	private async refresh(): Promise<void> {
+		const wasFollowing = this.scrollFromBottom === 0;
+		this.lines = await readLogTail();
+		this.version++;
+		if (wasFollowing) this.scrollFromBottom = 0;
+		this.invalidate();
+		this.tui.requestRender();
+	}
+
+	private viewportHeight(): number {
+		return Math.max(8, Math.min(40, this.tui.terminal.rows - 6));
+	}
+
+	private bodyHeight(): number {
+		return Math.max(1, this.viewportHeight() - 4);
+	}
+
+	private clampScroll(): void {
+		this.scrollFromBottom = Math.max(0, Math.min(this.scrollFromBottom, Math.max(0, this.lines.length - this.bodyHeight())));
+	}
+
+	handleInput(data: string): void {
+		const page = Math.max(1, this.bodyHeight() - 2);
+		if (isKey(data, "escape") || data === "q") {
+			this.done();
+			return;
+		}
+		if (isKey(data, "up") || data === "k") this.scrollFromBottom++;
+		else if (isKey(data, "down") || data === "j") this.scrollFromBottom--;
+		else if (isKey(data, "home")) this.scrollFromBottom = this.lines.length;
+		else if (isKey(data, "end")) this.scrollFromBottom = 0;
+		else if (isKey(data, "pageUp") || data === "b") this.scrollFromBottom += page;
+		else if (isKey(data, "pageDown") || data === "f") this.scrollFromBottom -= page;
+		else return;
+
+		this.clampScroll();
+		this.invalidate();
+		this.tui.requestRender();
+	}
+
+	private borderLine(left: string, fill: string, right: string, width: number, title?: string): string {
+		const innerWidth = Math.max(0, width - 2);
+		let inner = this.theme.fg("border", fill.repeat(innerWidth));
+		if (title) {
+			const rawTitle = truncateText(` ${title} `, innerWidth);
+			const fillWidth = Math.max(0, innerWidth - rawTitle.length);
+			inner = this.theme.fg("accent", rawTitle) + this.theme.fg("border", fill.repeat(fillWidth));
+		}
+		return this.theme.fg("border", left) + inner + this.theme.fg("border", right);
+	}
+
+	private row(text: string, width: number, color?: (value: string) => string): string {
+		const innerWidth = Math.max(0, width - 4);
+		const content = truncateText(text.replace(/\t/g, "   "), innerWidth, "", true);
+		return this.theme.fg("border", "│") + " " + (color ? color(content) : content) + " " + this.theme.fg("border", "│");
+	}
+
+	render(width: number): string[] {
+		const height = this.viewportHeight();
+		if (
+			this.cachedWidth === width &&
+			this.cachedRows === height &&
+			this.cachedVersion === this.version &&
+			this.cachedScroll === this.scrollFromBottom
+		) {
+			return this.cachedLines;
+		}
+
+		this.clampScroll();
+		const bodyHeight = this.bodyHeight();
+		const start = Math.max(0, this.lines.length - bodyHeight - this.scrollFromBottom);
+		const visible = this.lines.slice(start, start + bodyHeight);
+		while (visible.length < bodyHeight) visible.unshift("");
+
+		const state = this.scrollFromBottom === 0 ? "live" : `${this.scrollFromBottom} lines up`;
+		const title = `ds4 log • ${state}`;
+		const help = `↑↓ scroll • Pg page • End live • q/Esc close • ${LOG_FILE}`;
+		const lines = [
+			this.borderLine("╭", "─", "╮", width, title),
+			...visible.map((line) => this.row(line, width)),
+			this.row(help, width, (value) => this.theme.fg("dim", value)),
+			this.borderLine("╰", "─", "╯", width),
+		];
+
+		this.cachedWidth = width;
+		this.cachedRows = height;
+		this.cachedVersion = this.version;
+		this.cachedScroll = this.scrollFromBottom;
+		this.cachedLines = lines;
+		return this.cachedLines;
+	}
+
+	invalidate(): void {
+		this.cachedWidth = 0;
+	}
+
+	dispose(): void {
+		if (this.timer) {
+			clearInterval(this.timer);
+			this.timer = undefined;
+		}
+	}
+}
+
+async function runLogged(command: string, args: string[], cwd: string, label: string): Promise<void> {
+	if (runtimeDisposed || shuttingDown) throw new Error(`${label} cancelled`);
+
+	await appendLog(`\n[${new Date().toISOString()}] ${label}\n$ ${[command, ...args].map(shellQuote).join(" ")}\n`);
+
+	const logFd = openSync(LOG_FILE, "a");
+	let closed = false;
+	const closeLog = () => {
+		if (!closed) {
+			closed = true;
+			closeSync(logFd);
+		}
+	};
+
+	await new Promise<void>((resolvePromise, reject) => {
+		let child: ChildProcess;
+		try {
+			child = spawn(command, args, {
+				cwd,
+				detached: process.platform !== "win32",
+				stdio: ["ignore", logFd, logFd],
+				env: process.env,
+			});
+		} catch (error) {
+			closeLog();
+			reject(error);
+			return;
+		}
+
+		activeSetupChild = child;
+
+		const finish = (error?: Error) => {
+			if (activeSetupChild === child) activeSetupChild = undefined;
+			closeLog();
+			if (error) reject(error);
+			else resolvePromise();
+		};
+
+		child.on("error", (error) => finish(error));
+		child.on("close", (code, signal) => {
+			if (runtimeDisposed || shuttingDown) {
+				finish(new Error(`${label} cancelled`));
+			} else if (code === 0) {
+				finish();
+			} else {
+				finish(new Error(`${label} failed (${signal ? `signal ${signal}` : `exit ${code}`}); see ${LOG_FILE}`));
+			}
+		});
+	});
+}
+
+function killActiveSetupChild(): void {
+	const child = activeSetupChild;
+	if (!child?.pid) return;
+	try {
+		process.kill(process.platform === "win32" ? child.pid : -child.pid, "SIGTERM");
+	} catch {}
+}
+
+async function isDs4Checkout(dir: string): Promise<boolean> {
+	try {
+		await Promise.all([
+			access(join(dir, "download_model.sh"), constants.F_OK),
+			access(join(dir, "Makefile"), constants.F_OK),
+			access(join(dir, "ds4_server.c"), constants.F_OK),
+		]);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function ensureSupportCheckout(onStatus?: StatusCallback): Promise<string> {
+	if (await isDs4Checkout(SUPPORT_DIR)) {
+		try {
+			return await realpath(SUPPORT_DIR);
+		} catch {
+			return SUPPORT_DIR;
+		}
+	}
+
+	try {
+		await stat(SUPPORT_DIR);
+		throw new Error(`${SUPPORT_DIR} exists but does not look like a ds4 checkout`);
+	} catch (error: any) {
+		if (error?.code !== "ENOENT") throw error;
+	}
+
+	onStatus?.("cloning ds4 support checkout");
+	await mkdir(DS4_DIR, { recursive: true });
+	await runLogged(
+		"git",
+		["clone", "--branch", SUPPORT_BRANCH, "--single-branch", "--depth", "1", SUPPORT_REPO, SUPPORT_DIR],
+		DS4_DIR,
+		"clone ds4 support checkout",
+	);
+
+	if (!(await isDs4Checkout(SUPPORT_DIR))) {
+		throw new Error(`Cloned ${SUPPORT_REPO} but ${SUPPORT_DIR} does not look like a ds4 checkout`);
+	}
+	return SUPPORT_DIR;
+}
+
+async function resolveRuntimeDirLocked(onStatus?: StatusCallback): Promise<string> {
+	if (resolvedRuntimeDir) return resolvedRuntimeDir;
+
+	const forced = process.env.DS4_RUNTIME_DIR;
+	if (forced) {
+		const dir = resolve(forced);
+		if (!(await isDs4Checkout(dir))) throw new Error(`DS4_RUNTIME_DIR=${dir} is not a ds4 checkout`);
+		resolvedRuntimeDir = dir;
+		return dir;
+	}
+
+	resolvedRuntimeDir = await ensureSupportCheckout(onStatus);
+	return resolvedRuntimeDir;
+}
+
+async function ensureBuilt(runtimeDir: string, onStatus?: StatusCallback): Promise<void> {
+	try {
+		await access(join(runtimeDir, "ds4-server"), constants.X_OK);
+		return;
+	} catch {}
+
+	onStatus?.("building ds4-server");
+	await runLogged("make", ["ds4-server"], runtimeDir, "build ds4-server");
+	await access(join(runtimeDir, "ds4-server"), constants.X_OK);
+}
+
+async function ensureModel(runtimeDir: string, onStatus?: StatusCallback): Promise<void> {
+	const quant = selectedModelQuant();
+	onStatus?.(`ensuring ${quant} model`);
+	await runLogged("./download_model.sh", [quant], runtimeDir, `download ${quant} model`);
+}
+
+async function ensureRuntimeReadyLocked(onStatus?: StatusCallback): Promise<string> {
+	const runtimeDir = await resolveRuntimeDirLocked(onStatus);
+	if (runtimeDisposed || shuttingDown) return runtimeDir;
+	await ensureBuilt(runtimeDir, onStatus);
+	if (runtimeDisposed || shuttingDown) return runtimeDir;
+	await ensureModel(runtimeDir, onStatus);
+	return runtimeDir;
+}
+
+async function isLockStale(): Promise<boolean> {
+	const owner = await readJson<{ pid?: number }>(join(LOCK_DIR, "owner.json"));
+	if (owner?.pid) return !isPidAlive(owner.pid);
+
+	try {
+		const info = await stat(LOCK_DIR);
+		return Date.now() - info.mtimeMs > LOCK_STALE_MS;
+	} catch {
+		return true;
+	}
+}
+
+async function withLock<T>(fn: () => Promise<T>, timeoutMs = LOCK_TIMEOUT_MS, abortOnDispose = false): Promise<T> {
+	await mkdir(DS4_DIR, { recursive: true });
+	const started = Date.now();
+
+	while (true) {
+		if (abortOnDispose && (runtimeDisposed || shuttingDown)) throw new Error("ds4 startup cancelled");
+		try {
+			await mkdir(LOCK_DIR);
+			await writeJsonAtomic(join(LOCK_DIR, "owner.json"), {
+				managedBy: MANAGED_BY,
+				pid: process.pid,
+				createdAt: Date.now(),
+			});
+			break;
+		} catch (error: any) {
+			if (error?.code !== "EEXIST") throw error;
+			if (await isLockStale()) {
+				await rm(LOCK_DIR, { recursive: true, force: true });
+				continue;
+			}
+			if (timeoutMs > 0 && Date.now() - started > timeoutMs) {
+				throw new Error(`Timed out waiting for ds4 lifecycle lock at ${LOCK_DIR}`);
+			}
+			await sleep(100 + Math.floor(Math.random() * 150));
+		}
+	}
+
+	try {
+		return await fn();
+	} finally {
+		await rm(LOCK_DIR, { recursive: true, force: true });
+	}
+}
+
+async function touchLease(): Promise<void> {
+	const now = Date.now();
+	const lease: Lease = {
+		managedBy: MANAGED_BY,
+		pid: process.pid,
+		cwd: process.cwd(),
+		startedAt: leaseStartedAt,
+		updatedAt: now,
+		updatedAtIso: new Date(now).toISOString(),
+	};
+	await writeJsonAtomic(LEASE_FILE, lease);
+}
+
+function startHeartbeat(): void {
+	if (heartbeat) clearInterval(heartbeat);
+	heartbeat = setInterval(() => {
+		void touchLease().catch(() => {});
+	}, HEARTBEAT_MS);
+	heartbeat.unref?.();
+}
+
+function stopHeartbeat(): void {
+	if (heartbeat) {
+		clearInterval(heartbeat);
+		heartbeat = undefined;
+	}
+}
+
+async function pruneLeases(): Promise<void> {
+	await mkdir(CLIENT_DIR, { recursive: true });
+	const entries = await readdir(CLIENT_DIR).catch(() => [] as string[]);
+	const now = Date.now();
+
+	for (const entry of entries) {
+		if (!entry.endsWith(".json")) continue;
+		const file = join(CLIENT_DIR, entry);
+		const [lease, info] = await Promise.all([readJson<Lease>(file), stat(file).catch(() => undefined)]);
+		const staleByAge = !info || now - info.mtimeMs > LEASE_TTL_MS;
+		const staleByPid = !isPidAlive(lease?.pid);
+		if (staleByAge || staleByPid) await removeFile(file);
+	}
+}
+
+async function activeLeaseCount(): Promise<number> {
+	await pruneLeases();
+	const entries = await readdir(CLIENT_DIR).catch(() => [] as string[]);
+	return entries.filter((entry) => entry.endsWith(".json")).length;
+}
+
+async function activateLease(): Promise<void> {
+	await ensureDirs();
+	await touchLease();
+	await pruneLeases();
+	startHeartbeat();
+}
+
+async function removeOwnLease(): Promise<void> {
+	await removeFile(LEASE_FILE);
+}
+
+async function readState(): Promise<ServerState | undefined> {
+	return readJson<ServerState>(STATE_FILE);
+}
+
+async function clearState(): Promise<void> {
+	await removeFile(STATE_FILE);
+}
+
+async function checkHttpReady(): Promise<boolean> {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), HTTP_CHECK_TIMEOUT_MS);
+	try {
+		const response = await fetch(`${API_BASE_URL}/models`, { signal: controller.signal });
+		return response.ok;
+	} catch {
+		return false;
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!isPidAlive(pid)) return true;
+		await sleep(500);
+	}
+	return !isPidAlive(pid);
+}
+
+async function waitForServerReady(onStatus?: StatusCallback): Promise<void> {
+	const started = Date.now();
+	let lastStatus = 0;
+
+	while (Date.now() - started < READY_TIMEOUT_MS) {
+		if (runtimeDisposed || shuttingDown) return;
+		if (await checkHttpReady()) return;
+
+		const state = await readState();
+		if (state?.pid && !isPidAlive(state.pid)) {
+			throw new Error(`ds4-server exited before becoming ready; see ${LOG_FILE}`);
+		}
+
+		if (Date.now() - lastStatus > 10_000) {
+			const elapsed = Math.round((Date.now() - started) / 1000);
+			onStatus?.(`ds4-server starting (${elapsed}s)`);
+			lastStatus = Date.now();
+		}
+		await sleep(1_000);
+	}
+
+	throw new Error(`Timed out waiting for ds4-server at ${API_BASE_URL}; see ${LOG_FILE}`);
+}
+
+async function startServerLocked(runtimeDir: string): Promise<void> {
+	const binary = process.env.DS4_SERVER_BINARY ?? join(runtimeDir, "ds4-server");
+	try {
+		await access(binary, constants.X_OK);
+	} catch {
+		throw new Error(`Cannot execute ds4-server at ${binary}`);
+	}
+
+	await appendLog(`\n[${new Date().toISOString()}] start ds4-server\n$ ${[binary, ...SERVER_ARGS].map(shellQuote).join(" ")}\n`);
+	const logFd = openSync(LOG_FILE, "a");
+	let childPid: number | undefined;
+	try {
+		const child = spawn(binary, SERVER_ARGS, {
+			cwd: runtimeDir,
+			detached: true,
+			stdio: ["ignore", logFd, logFd],
+			env: process.env,
+		});
+		child.unref();
+		childPid = child.pid;
+	} finally {
+		closeSync(logFd);
+	}
+
+	if (!childPid) throw new Error("Failed to start ds4-server: no child PID");
+
+	const now = Date.now();
+	const state: ServerState = {
+		managedBy: MANAGED_BY,
+		pid: childPid,
+		baseUrl: API_BASE_URL,
+		cwd: runtimeDir,
+		binary,
+		args: SERVER_ARGS,
+		startedAt: now,
+		startedAtIso: new Date(now).toISOString(),
+	};
+	await writeJsonAtomic(STATE_FILE, state);
+}
+
+async function ensureServerManagedInner(onStatus?: StatusCallback): Promise<void> {
+	if (runtimeDisposed || shuttingDown) return;
+	await activateLease();
+	if (runtimeDisposed || shuttingDown) return;
+
+	let stoppingPid: number | undefined;
+
+	await withLock(async () => {
+		await touchLease();
+		await pruneLeases();
+
+		const state = await readState();
+		if (state?.pid && isPidAlive(state.pid)) {
+			if (state.stopping) stoppingPid = state.pid;
+			return;
+		}
+
+		if (state?.pid) await clearState();
+		if (await checkHttpReady()) return;
+		if (runtimeDisposed || shuttingDown) return;
+
+		const runtimeDir = await ensureRuntimeReadyLocked(onStatus);
+		if (runtimeDisposed || shuttingDown) return;
+
+		onStatus?.("starting ds4-server");
+		await startServerLocked(runtimeDir);
+	}, STARTUP_LOCK_TIMEOUT_MS, true);
+
+	if (runtimeDisposed || shuttingDown) return;
+
+	if (stoppingPid) {
+		onStatus?.("waiting for previous ds4-server shutdown");
+		if (!(await waitForPidExit(stoppingPid, SHUTDOWN_GRACE_MS))) {
+			throw new Error(`Previous ds4-server pid ${stoppingPid} did not exit`);
+		}
+		await withLock(async () => {
+			const state = await readState();
+			if (state?.pid === stoppingPid && !isPidAlive(stoppingPid)) await clearState();
+		}, LOCK_TIMEOUT_MS);
+		return ensureServerManagedInner(onStatus);
+	}
+
+	await waitForServerReady(onStatus);
+}
+
+function ensureServerManaged(onStatus?: StatusCallback): Promise<void> {
+	if (!startupPromise) {
+		startupPromise = ensureServerManagedInner(onStatus).finally(() => {
+			startupPromise = undefined;
+		});
+	}
+	return startupPromise;
+}
+
+async function signalManagedServerStopLocked(): Promise<number | undefined> {
+	const state = await readState();
+	if (!state || state.managedBy !== MANAGED_BY) return undefined;
+	if (!isPidAlive(state.pid)) {
+		await clearState();
+		return undefined;
+	}
+
+	const now = Date.now();
+	await writeJsonAtomic(STATE_FILE, {
+		...state,
+		stopping: true,
+		stoppingAt: now,
+		stoppingAtIso: new Date(now).toISOString(),
+	});
+
+	try {
+		process.kill(state.pid, "SIGTERM");
+		return state.pid;
+	} catch (error: any) {
+		if (error?.code === "ESRCH") {
+			await clearState();
+			return undefined;
+		}
+		throw error;
+	}
+}
+
+async function stopServerIfUnused(): Promise<void> {
+	let stoppingPid: number | undefined;
+
+	await removeOwnLease();
+	await withLock(async () => {
+		await pruneLeases();
+		if ((await activeLeaseCount()) > 0) return;
+		stoppingPid = await signalManagedServerStopLocked();
+	}, SHUTDOWN_LOCK_TIMEOUT_MS);
+
+	if (!stoppingPid) return;
+
+	await waitForPidExit(stoppingPid, SHUTDOWN_GRACE_MS);
+	await withLock(async () => {
+		const state = await readState();
+		if (state?.pid === stoppingPid && !isPidAlive(stoppingPid)) await clearState();
+	}, SHUTDOWN_LOCK_TIMEOUT_MS);
+}
+
+function registerDs4Command(pi: ExtensionAPI): void {
+	pi.registerCommand("ds4", {
+		description: "Show the live ds4-server log",
+		handler: async (_args, ctx) => {
+			if (!ctx.hasUI) {
+				ctx.ui.notify(`ds4 log: ${LOG_FILE}`, "info");
+				return;
+			}
+
+			let viewer: Ds4LogViewer | undefined;
+			try {
+				await ctx.ui.custom<void>(
+					(tui, theme, _keybindings, done) => {
+						viewer = new Ds4LogViewer(tui, theme, done);
+						return viewer;
+					},
+					{
+						overlay: true,
+						overlayOptions: {
+							width: "90%",
+							minWidth: 60,
+							maxHeight: "85%",
+							anchor: "center",
+							margin: 1,
+						},
+					},
+				);
+			} finally {
+				viewer?.dispose();
+			}
+		},
+	});
+}
+
+function registerDs4Provider(pi: ExtensionAPI): void {
+	pi.registerProvider(PROVIDER_ID, {
+		name: "ds4.c local",
+		baseUrl: API_BASE_URL,
+		api: "openai-completions",
+		apiKey: "dsv4-local",
+		compat: {
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			supportsUsageInStreaming: true,
+			maxTokensField: "max_tokens",
+			supportsStrictMode: false,
+			thinkingFormat: "deepseek",
+			requiresReasoningContentOnAssistantMessages: true,
+		},
+		models: [
+			{
+				id: MODEL_ID,
+				name: "DeepSeek V4 Flash (ds4.c local)",
+				reasoning: true,
+				thinkingLevelMap: {
+					off: null,
+					minimal: "low",
+					low: "low",
+					medium: "medium",
+					high: "high",
+					xhigh: "xhigh",
+				},
+				input: ["text"],
+				contextWindow: 100000,
+				maxTokens: 384000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			},
+		],
+	} as any);
+}
+
+export default function (pi: ExtensionAPI) {
+	runtimeDisposed = false;
+	shuttingDown = false;
+	leaseStartedAt = Date.now();
+	startupPromise = undefined;
+	activeSetupChild = undefined;
+	resolvedRuntimeDir = undefined;
+
+	registerDs4Provider(pi);
+	registerDs4Command(pi);
+
+	pi.on("session_start", (_event, ctx) => {
+		const setStatus = (message: string | undefined) => {
+			if (ctx.hasUI) ctx.ui.setStatus("ds4", message);
+		};
+
+		setStatus("ds4 starting");
+		void ensureServerManaged(setStatus)
+			.then(() => setStatus(undefined))
+			.catch((error) => {
+				if (runtimeDisposed) return;
+				setStatus("ds4 error");
+				ctx.ui.notify(`ds4-server startup failed: ${describeError(error)}`, "error");
+			});
+	});
+
+	pi.on("before_provider_request", async (_event, ctx) => {
+		if (ctx.model?.provider !== PROVIDER_ID || ctx.model?.id !== MODEL_ID) return;
+		const setStatus = (message: string | undefined) => {
+			if (ctx.hasUI) ctx.ui.setStatus("ds4", message);
+		};
+
+		setStatus("ds4 starting");
+		await ensureServerManaged(setStatus);
+		setStatus(undefined);
+	});
+
+	pi.on("session_shutdown", async (event, ctx) => {
+		runtimeDisposed = true;
+		stopHeartbeat();
+		killActiveSetupChild();
+
+		try {
+			if (startupPromise) await Promise.race([startupPromise.catch(() => {}), sleep(5_000)]);
+		} catch {}
+
+		// Session switches and /reload immediately create another extension instance
+		// in the same pi process. Keep the lease for those hand-offs.
+		if (event.reason !== "quit") return;
+
+		shuttingDown = true;
+		try {
+			await stopServerIfUnused();
+		} catch (error) {
+			if (!isLockTimeout(error)) ctx.ui.notify(`ds4-server shutdown failed: ${describeError(error)}`, "error");
+		}
+	});
+}
