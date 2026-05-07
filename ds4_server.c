@@ -41,6 +41,7 @@ static volatile sig_atomic_t g_listen_fd = -1;
 
 static void stop_signal_handler(int sig) {
     (void)sig;
+    if (g_stop_requested) _exit(130);
     g_stop_requested = 1;
     if (g_listen_fd >= 0) {
         int fd = (int)g_listen_fd;
@@ -5410,7 +5411,8 @@ static void generate_job(server *s, job *j) {
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
 
-    while (completion < max_tokens && ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
+    while (!g_stop_requested && completion < max_tokens &&
+           ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
         const bool in_tool_call = j->req.kind == REQ_CHAT && j->req.has_tools &&
                                   saw_tool_start && !saw_tool_end;
         float temperature = j->req.temperature;
@@ -5577,6 +5579,21 @@ static void generate_job(server *s, job *j) {
         if (stop_decode) break;
     }
 
+    if (g_stop_requested && strcmp(finish, "error") != 0) {
+        finish = "error";
+        snprintf(err, sizeof(err), "shutdown requested");
+    }
+
+    if (j->req.kind == REQ_CHAT && j->req.has_tools &&
+        saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
+    {
+        /* A partial streamed tool call cannot be retracted.  If the model ends
+         * before closing the DSML block, fail the turn instead of letting clients
+         * execute an incomplete `{}` or partially parsed argument object. */
+        finish = "error";
+        snprintf(err, sizeof(err), "unterminated tool call");
+    }
+
     if (completion > last_decode_log_completion) {
         log_decode_progress(j->req.kind, ctx_span, completion,
                             j->req.has_tools,
@@ -5600,13 +5617,18 @@ static void generate_job(server *s, job *j) {
     char *parsed_reasoning = NULL;
     const char *final_finish = finish;
     if (j->req.kind == REQ_CHAT) {
-        if (!parse_generated_message(text.ptr ? text.ptr : "", &parsed_content,
-                                     &parsed_reasoning, &parsed_calls)) {
+        bool parsed_ok = parse_generated_message(text.ptr ? text.ptr : "", &parsed_content,
+                                                 &parsed_reasoning, &parsed_calls);
+        if (!parsed_ok) {
             free(parsed_content);
             free(parsed_reasoning);
             parsed_content = xstrdup(text.ptr ? text.ptr : "");
             parsed_reasoning = NULL;
             tool_calls_free(&parsed_calls);
+            if (j->req.has_tools && saw_tool_start && strcmp(final_finish, "error") != 0) {
+                final_finish = "error";
+                snprintf(err, sizeof(err), "invalid tool call");
+            }
         }
         if (parsed_calls.len) final_finish = "tool_calls";
     }
