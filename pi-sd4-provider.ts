@@ -1115,7 +1115,6 @@ function registerDs4Provider(pi: ExtensionAPI): void {
 				name: "DeepSeek V4 Flash (ds4.c local)",
 				reasoning: true,
 				thinkingLevelMap: {
-					off: null,
 					minimal: "low",
 					low: "low",
 					medium: "medium",
