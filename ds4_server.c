@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -36,6 +37,7 @@ static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
+#define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
 
 static void stop_signal_handler(int sig) {
     (void)sig;
@@ -2415,14 +2417,35 @@ bad:
     return false;
 }
 
+static long long wall_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
 static bool send_all(int fd, const void *p, size_t n) {
     const char *s = p;
+    long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
     while (n) {
+        if (g_stop_requested) return false;
         ssize_t w = send(fd, s, n, 0);
         if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            long long remaining = deadline - wall_ms();
+            if (remaining <= 0) return false;
+            struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+            int timeout = remaining > 50 ? 50 : (int)remaining;
+            int rc;
+            do {
+                rc = poll(&pfd, 1, timeout);
+            } while (rc < 0 && errno == EINTR);
+            if (rc < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
+            continue;
+        }
         if (w <= 0) return false;
         s += w;
         n -= (size_t)w;
+        deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
     }
     return true;
 }
@@ -2453,6 +2476,26 @@ static void json_escape_n(buf *b, const char *s, size_t n) {
     char *tmp = xstrndup(s ? s : "", n);
     json_escape(b, tmp);
     free(tmp);
+}
+
+static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') {
+            buf_putc(b, '\\');
+            buf_putc(b, (char)c);
+        } else if (c == '\n') {
+            buf_puts(b, "\\n");
+        } else if (c == '\r') {
+            buf_puts(b, "\\r");
+        } else if (c == '\t') {
+            buf_puts(b, "\\t");
+        } else if (c < 0x20) {
+            buf_printf(b, "\\u%04x", (unsigned)c);
+        } else {
+            buf_putc(b, (char)c);
+        }
+    }
 }
 
 #define DS4_DSML "｜DSML｜"
@@ -2888,8 +2931,33 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
 typedef enum {
     OPENAI_STREAM_THINKING,
     OPENAI_STREAM_TEXT,
+    OPENAI_STREAM_TOOL,
     OPENAI_STREAM_SUPPRESS,
 } openai_stream_mode;
+
+typedef enum {
+    OPENAI_TOOL_BETWEEN_INVOKES,
+    OPENAI_TOOL_BETWEEN_PARAMS,
+    OPENAI_TOOL_PARAM_VALUE,
+    OPENAI_TOOL_DONE,
+    OPENAI_TOOL_ERROR,
+} openai_tool_stream_state;
+
+typedef struct {
+    openai_tool_stream_state state;
+    const char *tool_calls_end;
+    const char *invoke_start;
+    const char *invoke_end;
+    const char *param_start;
+    const char *param_end;
+    size_t parse_pos;
+    int index;
+    bool active;
+    bool emitted_any;
+    bool args_open;
+    bool first_param;
+    bool param_is_string;
+} openai_tool_stream;
 
 typedef struct {
     openai_stream_mode mode;
@@ -2898,6 +2966,7 @@ typedef struct {
     bool checked_think_prefix;
     bool sent_reasoning;
     bool sent_content;
+    openai_tool_stream tool;
 } openai_stream;
 
 static void openai_stream_start(const request *r, openai_stream *st) {
@@ -2926,6 +2995,327 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
     return ok;
+}
+
+/* OpenAI clients can consume function.arguments as a stream of JSON text
+ * fragments.  DS4 generates XML-ish DSML instead, so this parser switches to a
+ * hidden tool mode at <...tool_calls>, emits the tool header once the invoke tag
+ * is complete, then translates each parameter body into argument deltas while
+ * holding only tiny tails for partial closing tags, UTF-8, and DSML entities. */
+static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char *id,
+                                           int index, const char *name) {
+    buf b = {0};
+    char tool_id[128];
+    long now = (long)time(NULL);
+    snprintf(tool_id, sizeof(tool_id), "%s_tool_%d", id, index);
+    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":");
+    buf_printf(&b, "%d", index);
+    buf_puts(&b, ",\"id\":");
+    json_escape(&b, tool_id);
+    buf_puts(&b, ",\"type\":\"function\",\"function\":{\"name\":");
+    json_escape(&b, name ? name : "");
+    buf_puts(&b, ",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n");
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char *id,
+                                            int index, const char *text, size_t len) {
+    if (len == 0) return true;
+    buf b = {0};
+    long now = (long)time(NULL);
+    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    json_escape(&b, r->model);
+    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":");
+    buf_printf(&b, "%d", index);
+    buf_puts(&b, ",\"function\":{\"arguments\":");
+    json_escape_n(&b, text, len);
+    buf_puts(&b, "}}]},\"finish_reason\":null}]}\n\n");
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
+}
+
+static bool raw_full_lit(const char *raw, size_t raw_len, size_t pos, const char *lit) {
+    size_t n = strlen(lit);
+    return pos <= raw_len && raw_len - pos >= n && !memcmp(raw + pos, lit, n);
+}
+
+static bool raw_partial_lit(const char *raw, size_t raw_len, size_t pos, const char *lit) {
+    size_t n = strlen(lit);
+    if (pos > raw_len || raw_len - pos >= n) return false;
+    return !memcmp(raw + pos, lit, raw_len - pos);
+}
+
+static bool raw_partial_any(const char *raw, size_t raw_len, size_t pos,
+                            const char *a, const char *b) {
+    return raw_partial_lit(raw, raw_len, pos, a) || raw_partial_lit(raw, raw_len, pos, b);
+}
+
+static const char *find_lit_bounded(const char *s, size_t n, const char *lit) {
+    size_t m = strlen(lit);
+    if (m == 0) return s;
+    if (n < m) return NULL;
+    for (size_t i = 0; i <= n - m; i++) {
+        if (!memcmp(s + i, lit, m)) return s + i;
+    }
+    return NULL;
+}
+
+static size_t dsml_entity_stream_safe_len(const char *raw, size_t start, size_t limit) {
+    static const char *ents[] = {"&amp;", "&lt;", "&gt;", "&quot;", "&apos;"};
+    const size_t max_ent = 6;
+    size_t scan = limit > start + max_ent ? limit - max_ent : start;
+    for (size_t i = limit; i > scan; i--) {
+        if (raw[i - 1] != '&') continue;
+        size_t amp = i - 1;
+        size_t tail = limit - amp;
+        for (size_t ei = 0; ei < sizeof(ents) / sizeof(ents[0]); ei++) {
+            size_t elen = strlen(ents[ei]);
+            if (tail < elen && !memcmp(raw + amp, ents[ei], tail)) return amp;
+        }
+        break;
+    }
+    return limit;
+}
+
+static size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
+                                               size_t raw_len, const char *param_end,
+                                               bool is_string) {
+    size_t limit = raw_len;
+    size_t end_len = strlen(param_end);
+    size_t scan = raw_len > start + end_len ? raw_len - end_len : start;
+    for (size_t i = raw_len; i > scan; i--) {
+        if (raw[i - 1] != '<') continue;
+        size_t marker = i - 1;
+        size_t tail = raw_len - marker;
+        if (tail < end_len && !memcmp(raw + marker, param_end, tail)) limit = marker;
+        break;
+    }
+    if (is_string) limit = dsml_entity_stream_safe_len(raw, start, limit);
+    return utf8_stream_safe_len(raw, start, limit, false);
+}
+
+static bool openai_tool_emit_args_fragment(int fd, const request *r, const char *id,
+                                           openai_tool_stream *ts,
+                                           const char *text, size_t len) {
+    return sse_chat_tool_call_args_delta_n(fd, r, id, ts->index, text, len);
+}
+
+static bool openai_tool_emit_string_value(int fd, const request *r, const char *id,
+                                          openai_tool_stream *ts,
+                                          const char *text, size_t len) {
+    if (len == 0) return true;
+    char *raw = xstrndup(text, len);
+    char *unescaped = dsml_unescape_text(raw);
+    buf frag = {0};
+    json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
+    bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    free(unescaped);
+    free(raw);
+    return ok;
+}
+
+static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *id,
+                                          openai_tool_stream *ts,
+                                          const char *name, bool is_string) {
+    buf frag = {0};
+    if (ts->first_param) ts->first_param = false;
+    else buf_putc(&frag, ',');
+    json_escape(&frag, name ? name : "");
+    buf_putc(&frag, ':');
+    if (is_string) buf_putc(&frag, '"');
+    bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    return ok;
+}
+
+static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
+                                    size_t raw_len, size_t pos) {
+    memset(ts, 0, sizeof(*ts));
+    ts->active = true;
+    ts->state = OPENAI_TOOL_BETWEEN_INVOKES;
+    ts->parse_pos = pos;
+    if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START)) {
+        ts->parse_pos += strlen(DS4_TOOL_CALLS_START);
+        ts->tool_calls_end = DS4_TOOL_CALLS_END;
+        ts->invoke_start = DS4_INVOKE_START;
+        ts->invoke_end = DS4_INVOKE_END;
+        ts->param_start = DS4_PARAM_START;
+        ts->param_end = DS4_PARAM_END;
+    } else if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START_SHORT)) {
+        ts->parse_pos += strlen(DS4_TOOL_CALLS_START_SHORT);
+        ts->tool_calls_end = DS4_TOOL_CALLS_END_SHORT;
+        ts->invoke_start = DS4_INVOKE_START_SHORT;
+        ts->invoke_end = DS4_INVOKE_END_SHORT;
+        ts->param_start = DS4_PARAM_START_SHORT;
+        ts->param_end = DS4_PARAM_END_SHORT;
+    } else if (raw_full_lit(raw, raw_len, pos, "<tool_calls>")) {
+        ts->parse_pos += strlen("<tool_calls>");
+        ts->tool_calls_end = "</tool_calls>";
+        ts->invoke_start = "<invoke";
+        ts->invoke_end = "</invoke>";
+        ts->param_start = "<parameter";
+        ts->param_end = "</parameter>";
+    } else {
+        ts->active = false;
+        ts->state = OPENAI_TOOL_ERROR;
+        return false;
+    }
+    return true;
+}
+
+static bool openai_tool_stream_fail(openai_tool_stream *ts) {
+    ts->active = false;
+    ts->state = OPENAI_TOOL_ERROR;
+    return true;
+}
+
+static bool openai_tool_start_invoke(int fd, const request *r, const char *id,
+                                     openai_tool_stream *ts,
+                                     const char *raw, size_t raw_len) {
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = dsml_attr(tag, "name");
+    free(tag);
+    if (!name) return openai_tool_stream_fail(ts);
+
+    bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, name) &&
+              openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
+    free(name);
+    if (!ok) return false;
+
+    ts->emitted_any = true;
+    ts->args_open = true;
+    ts->first_param = true;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = OPENAI_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+static bool openai_tool_start_param(int fd, const request *r, const char *id,
+                                    openai_tool_stream *ts,
+                                    const char *raw, size_t raw_len) {
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = dsml_attr(tag, "name");
+    char *is_string = dsml_attr(tag, "string");
+    free(tag);
+    if (!name || !is_string) {
+        free(name);
+        free(is_string);
+        return openai_tool_stream_fail(ts);
+    }
+    bool string_value = !strcmp(is_string, "true");
+    bool ok = openai_tool_emit_param_prefix(fd, r, id, ts, name, string_value);
+    free(name);
+    free(is_string);
+    if (!ok) return false;
+
+    ts->param_is_string = string_value;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = OPENAI_TOOL_PARAM_VALUE;
+    return true;
+}
+
+static bool openai_tool_finish_param(int fd, const request *r, const char *id,
+                                     openai_tool_stream *ts,
+                                     const char *raw, size_t value_end) {
+    if (value_end > ts->parse_pos) {
+        bool ok = ts->param_is_string ?
+            openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
+                                          value_end - ts->parse_pos) :
+            openai_tool_emit_args_fragment(fd, r, id, ts, raw + ts->parse_pos,
+                                           value_end - ts->parse_pos);
+        if (!ok) return false;
+    }
+    if (ts->param_is_string &&
+        !openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;
+    ts->parse_pos = value_end + strlen(ts->param_end);
+    ts->state = OPENAI_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+static bool openai_tool_stream_update(int fd, const request *r, const char *id,
+                                      openai_tool_stream *ts,
+                                      const char *raw, size_t raw_len) {
+    while (ts->active && ts->parse_pos < raw_len) {
+        if (ts->state == OPENAI_TOOL_BETWEEN_INVOKES) {
+            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->tool_calls_end)) {
+                ts->parse_pos += strlen(ts->tool_calls_end);
+                ts->active = false;
+                ts->state = OPENAI_TOOL_DONE;
+                return true;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->tool_calls_end, ts->invoke_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_start)) {
+                size_t before_pos = ts->parse_pos;
+                openai_tool_stream_state before_state = ts->state;
+                if (!openai_tool_start_invoke(fd, r, id, ts, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return openai_tool_stream_fail(ts);
+        }
+
+        if (ts->state == OPENAI_TOOL_BETWEEN_PARAMS) {
+            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_end)) {
+                if (ts->args_open &&
+                    !openai_tool_emit_args_fragment(fd, r, id, ts, "}", 1)) return false;
+                ts->args_open = false;
+                ts->parse_pos += strlen(ts->invoke_end);
+                ts->index++;
+                ts->state = OPENAI_TOOL_BETWEEN_INVOKES;
+                continue;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->invoke_end, ts->param_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->param_start)) {
+                size_t before_pos = ts->parse_pos;
+                openai_tool_stream_state before_state = ts->state;
+                if (!openai_tool_start_param(fd, r, id, ts, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return openai_tool_stream_fail(ts);
+        }
+
+        if (ts->state == OPENAI_TOOL_PARAM_VALUE) {
+            const char *end = find_lit_bounded(raw + ts->parse_pos,
+                                               raw_len - ts->parse_pos,
+                                               ts->param_end);
+            if (end) {
+                if (!openai_tool_finish_param(fd, r, id, ts, raw,
+                                              (size_t)(end - raw))) return false;
+                continue;
+            }
+            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
+                                                            raw_len, ts->param_end,
+                                                            ts->param_is_string);
+            if (limit > ts->parse_pos) {
+                bool ok = ts->param_is_string ?
+                    openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
+                                                  limit - ts->parse_pos) :
+                    openai_tool_emit_args_fragment(fd, r, id, ts, raw + ts->parse_pos,
+                                                   limit - ts->parse_pos);
+                if (!ok) return false;
+                ts->parse_pos = limit;
+            }
+            return true;
+        }
+
+        return true;
+    }
+    return true;
 }
 
 static bool openai_sse_stream_update(int fd, const request *r, const char *id,
@@ -2993,10 +3383,19 @@ static bool openai_sse_stream_update(int fd, const request *r, const char *id,
 
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
-            st->mode = OPENAI_STREAM_SUPPRESS;
+            if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+                st->mode = OPENAI_STREAM_TOOL;
+            } else {
+                st->mode = OPENAI_STREAM_SUPPRESS;
+            }
         } else if (final) {
             st->mode = OPENAI_STREAM_SUPPRESS;
         }
+    }
+
+    if (st->mode == OPENAI_STREAM_TOOL) {
+        if (!openai_tool_stream_update(fd, r, id, &st->tool, raw, raw_len)) return false;
+        if (!st->tool.active) st->mode = OPENAI_STREAM_SUPPRESS;
     }
     return true;
 }
@@ -3010,7 +3409,7 @@ static bool openai_sse_finish_live(int fd, const request *r, const char *id,
 
     buf b = {0};
     long now = (long)time(NULL);
-    if (calls && calls->len) {
+    if (calls && calls->len && !st->tool.emitted_any) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
@@ -3488,6 +3887,7 @@ static double now_sec(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
+
 
 typedef enum {
     LOG_DEFAULT,
@@ -4970,13 +5370,21 @@ static void generate_job(server *s, job *j) {
         j->req.kind == REQ_CHAT &&
         j->req.has_tools;
     if (j->req.stream) {
-        if (!sse_headers(j->fd)) return;
+        if (!sse_headers(j->fd)) {
+            server_log(LOG_GENERATION, "ds4-server: %s ctx=%s sse headers failed", j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
+            return;
+        }
         if (j->req.api == API_ANTHROPIC &&
             !anthropic_sse_start_live(j->fd, &j->req, id,
-                                      j->req.prompt.len, &anthropic_live)) return;
-        if (j->req.api == API_OPENAI &&
-            j->req.kind == REQ_CHAT &&
-            !sse_chunk(j->fd, &j->req, id, NULL, NULL)) return;
+                                      j->req.prompt.len, &anthropic_live)) {
+            server_log(LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
+            return;
+        }
+        if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
+            !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
+            server_log(LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
+            return;
+        }
         if (openai_live_tools) openai_stream_start(&j->req, &openai_live);
     }
 
@@ -5085,6 +5493,8 @@ static void generate_job(server *s, job *j) {
                 bool ok = sse_chunk(j->fd, &j->req, id, delta, NULL);
                 free(delta);
                 if (!ok) {
+                    finish = "error";
+                    snprintf(err, sizeof(err), "client stream write failed");
                     free(piece);
                     stop_decode = true;
                     break;
@@ -5095,6 +5505,8 @@ static void generate_job(server *s, job *j) {
                 !anthropic_sse_stream_update(j->fd, &j->req, id,
                                              &anthropic_live, text.ptr, stream_len,
                                              false)) {
+                finish = "error";
+                snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
                 stop_decode = true;
                 break;
@@ -5103,6 +5515,8 @@ static void generate_job(server *s, job *j) {
                 !openai_sse_stream_update(j->fd, &j->req, id,
                                           &openai_live, text.ptr, stream_len,
                                           false)) {
+                finish = "error";
+                snprintf(err, sizeof(err), "client stream write failed");
                 free(piece);
                 stop_decode = true;
                 break;
@@ -5210,24 +5624,31 @@ static void generate_job(server *s, job *j) {
     }
 
     if (j->req.stream) {
+        bool response_ok = true;
         if (j->req.api == API_ANTHROPIC) {
-            anthropic_sse_finish_live(j->fd, &j->req, id, &anthropic_live,
-                                      text.ptr ? text.ptr : "", text.len,
-                                      &parsed_calls, final_finish, completion);
+            response_ok = anthropic_sse_finish_live(j->fd, &j->req, id, &anthropic_live,
+                                                    text.ptr ? text.ptr : "", text.len,
+                                                    &parsed_calls, final_finish, completion);
         } else if (openai_live_tools) {
-            openai_sse_finish_live(j->fd, &j->req, id, &openai_live,
-                                   text.ptr ? text.ptr : "", text.len,
-                                   &parsed_calls, final_finish,
-                                   j->req.prompt.len, completion);
+            response_ok = openai_sse_finish_live(j->fd, &j->req, id, &openai_live,
+                                                 text.ptr ? text.ptr : "", text.len,
+                                                 &parsed_calls, final_finish,
+                                                 j->req.prompt.len, completion);
         } else if (structured_stream) {
-            sse_chat_finish(j->fd, &j->req, id,
-                            parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                            parsed_reasoning,
-                            &parsed_calls, final_finish,
-                            j->req.prompt.len, completion);
+            response_ok = sse_chat_finish(j->fd, &j->req, id,
+                                          parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                                          parsed_reasoning,
+                                          &parsed_calls, final_finish,
+                                          j->req.prompt.len, completion);
         } else {
-            sse_chunk(j->fd, &j->req, id, NULL, final_finish);
-            sse_done(j->fd, &j->req, id, j->req.prompt.len, completion);
+            response_ok = sse_chunk(j->fd, &j->req, id, NULL, final_finish) &&
+                          sse_done(j->fd, &j->req, id, j->req.prompt.len, completion);
+        }
+        if (!response_ok) {
+            server_log(LOG_DEFAULT,
+                       "ds4-server: %s ctx=%s final stream failed",
+                       j->req.kind == REQ_CHAT ? "chat" : "completion",
+                       ctx_span);
         }
     } else if (j->req.api == API_ANTHROPIC) {
         anthropic_final_response(j->fd, &j->req, id,
@@ -6170,6 +6591,156 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     close(sv[1]);
 }
 
+static void test_openai_tool_stream_sends_partial_arguments(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.tool_orders = make_bash_order();
+
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_partial_tool", NULL, NULL));
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "Before.\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo partial";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_partial_tool", &st,
+                                         raw, strlen(raw), false));
+
+    const char *raw_complete =
+        "Before.\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo partial done" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_partial_tool", &st,
+                                         raw_complete, strlen(raw_complete), false));
+
+    char *parsed_content = NULL;
+    char *parsed_reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(raw_complete, &parsed_content, &parsed_reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(openai_sse_finish_live(sv[0], &r, "chatcmpl_partial_tool", &st,
+                                       raw_complete, strlen(raw_complete), &calls,
+                                       "tool_calls", 10, 4));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *text = strstr(out, "\"content\":\"Before.\"");
+    const char *tool = strstr(out, "\"tool_calls\"");
+    const char *key = strstr(out, "\\\"command\\\":\\\"");
+    const char *partial = strstr(out, "\"arguments\":\"echo partial\"");
+    const char *rest = strstr(out, "\"arguments\":\" done\"");
+    int tool_id_count = 0;
+    for (const char *p = out; (p = strstr(p, "chatcmpl_partial_tool_tool_0")) != NULL; p++) tool_id_count++;
+    TEST_ASSERT(text != NULL);
+    TEST_ASSERT(tool != NULL);
+    TEST_ASSERT(key != NULL);
+    TEST_ASSERT(partial != NULL);
+    TEST_ASSERT(rest != NULL);
+    TEST_ASSERT(text < tool);
+    TEST_ASSERT(tool < partial);
+    TEST_ASSERT(partial < rest);
+    TEST_ASSERT(tool_id_count == 1);
+    TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+    TEST_ASSERT(strstr(out, DS4_PARAM_START) == NULL);
+
+    free(out);
+    free(parsed_content);
+    free(parsed_reasoning);
+    tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw_invoke = DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_incomplete_tool", &st,
+                                         raw_invoke, strlen(raw_invoke), false));
+    TEST_ASSERT(st.mode == OPENAI_STREAM_TOOL);
+    TEST_ASSERT(st.tool.state == OPENAI_TOOL_BETWEEN_INVOKES);
+
+    const char *raw_param =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_incomplete_tool", &st,
+                                         raw_param, strlen(raw_param), false));
+    TEST_ASSERT(st.mode == OPENAI_STREAM_TOOL);
+    TEST_ASSERT(st.tool.state == OPENAI_TOOL_BETWEEN_PARAMS);
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
+    TEST_ASSERT(strstr(out, DS4_PARAM_START) == NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"edits\" string=\"false\">[1,2,3";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_raw_tool", &st,
+                                         raw, strlen(raw), false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"name\":\"edit\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"edits\\\":") != NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":\"[1,2,3\"") != NULL);
+    TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_streaming_holds_partial_utf8(void) {
     const char partial[] = {'A', ' ', (char)0xf0, (char)0x9f, 0};
     const char complete[] = {'A', ' ', (char)0xf0, (char)0x9f,
@@ -6854,6 +7425,9 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_thinking_and_tool_args_are_schema_ordered();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_openai_tool_stream_sends_incremental_text();
+    test_openai_tool_stream_sends_partial_arguments();
+    test_openai_tool_stream_waits_for_incomplete_tool_tags();
+    test_openai_tool_stream_sends_partial_raw_arguments();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
