@@ -1,5 +1,18 @@
 # ds4.c
 
+This repository is some slop patches by me on top of `ds4.c` to experiment
+with better streaming and an out-of-the-box experience for pi.
+
+You can install this repository URL to get both the pi extension and `ds4`
+going: it downloads the model automatically, manages the server for you, and
+does not require editing `models.json`.
+
+```sh
+pi install https://github.com/mitsuhiko/ds4
+```
+
+<hr>
+
 `ds4.c` is a small native inference engine for DeepSeek V4 Flash. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime, and not a framework. The main path is a DeepSeek V4 Flash-specific
