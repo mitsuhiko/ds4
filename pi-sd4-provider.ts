@@ -39,11 +39,10 @@ const BASE_URL = "http://127.0.0.1:8000";
 const API_BASE_URL = `${BASE_URL}/v1`;
 const SERVER_ARGS = ["--ctx", "100000", "--kv-disk-dir", KV_DIR, "--kv-disk-space-mb", "8192"];
 
-const HEARTBEAT_MS = 30_000;
-const LEASE_TTL_MS = 5 * 60_000;
+const HEARTBEAT_MS = 10_000;
+const LEASE_TTL_MS = 45_000;
 const LOCK_STALE_MS = 60_000;
 const LOCK_TIMEOUT_MS = 30_000;
-const SHUTDOWN_LOCK_TIMEOUT_MS = 2_000;
 const STARTUP_LOCK_TIMEOUT_MS = 24 * 60 * 60_000;
 const READY_TIMEOUT_MS = Number(process.env.DS4_READY_TIMEOUT_MS ?? 10 * 60_000);
 const HTTP_CHECK_TIMEOUT_MS = 1_500;
@@ -51,6 +50,7 @@ const SHUTDOWN_GRACE_MS = 60_000;
 const LOG_TAIL_BYTES = 256 * 1024;
 const LOG_MAX_LINES = 2_000;
 const LOG_POLL_MS = 1_000;
+const WATCHDOG_POLL_MS = 2_000;
 
 type ModelQuant = "q2" | "q4";
 
@@ -72,6 +72,7 @@ type Lease = {
 	managedBy: string;
 	usesDs4: true;
 	pid: number;
+	processStart: string;
 	cwd: string;
 	startedAt: number;
 	updatedAt: number;
@@ -84,12 +85,17 @@ type LogTui = { terminal: { rows: number }; requestRender: (force?: boolean) => 
 type LogTheme = { fg: (color: string, text: string) => string };
 type Component = { render(width: number): string[]; handleInput?(data: string): void; invalidate(): void };
 
+const WATCHDOG_SCRIPT_NAME = "ds4-watchdog.sh";
+const WATCHDOG_PID_FILE = join(DS4_DIR, `watchdog-${process.pid}.json`);
+
 let heartbeat: ReturnType<typeof setInterval> | undefined;
 let startupPromise: Promise<void> | undefined;
 let activeSetupChild: ChildProcess | undefined;
 let resolvedRuntimeDir: string | undefined;
 let leaseStartedAt = Date.now();
+let ownProcessStart: string | undefined;
 let leaseActive = false;
+let watchdogStarted = false;
 let runtimeDisposed = false;
 let shuttingDown = false;
 let writeSeq = 0;
@@ -360,6 +366,169 @@ class Ds4LogViewer implements Component {
 	}
 }
 
+async function execCapture(command: string, args: string[], timeoutMs = 2_000): Promise<string | undefined> {
+	return new Promise((resolvePromise) => {
+		let stdout = "";
+		let stderr = "";
+		let settled = false;
+		let child: ChildProcess;
+
+		const finish = (value: string | undefined) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			resolvePromise(value);
+		};
+
+		const timeout = setTimeout(() => {
+			try {
+				child?.kill("SIGTERM");
+			} catch {}
+			finish(undefined);
+		}, timeoutMs);
+		timeout.unref?.();
+
+		try {
+			child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+		} catch {
+			finish(undefined);
+			return;
+		}
+
+		child.stdout?.setEncoding("utf8");
+		child.stderr?.setEncoding("utf8");
+		child.stdout?.on("data", (chunk) => (stdout += chunk));
+		child.stderr?.on("data", (chunk) => (stderr += chunk));
+		child.on("error", () => finish(undefined));
+		child.on("close", (code) => finish(code === 0 ? stdout : stdout || stderr || undefined));
+	});
+}
+
+async function processArgs(pid: number): Promise<string | undefined> {
+	return (await execCapture("ps", ["-p", String(pid), "-o", "args="], 2_000))?.trim();
+}
+
+async function processStart(pid: number): Promise<string | undefined> {
+	return (await execCapture("ps", ["-p", String(pid), "-o", "lstart="], 2_000))?.trim() || undefined;
+}
+
+async function getOwnProcessStart(): Promise<string> {
+	ownProcessStart ??= (await processStart(process.pid)) ?? "unknown";
+	return ownProcessStart;
+}
+
+async function isLeaseForLiveProcess(lease: Lease | undefined): Promise<boolean> {
+	if (!lease || lease.managedBy !== MANAGED_BY || lease.usesDs4 !== true) return false;
+	if (!isPidAlive(lease.pid)) return false;
+	if (!lease.processStart) return false;
+	const currentStart = await processStart(lease.pid);
+	return currentStart === lease.processStart;
+}
+
+async function looksLikeDs4Server(pid: number): Promise<boolean> {
+	const args = await processArgs(pid);
+	return !!args && /(^|[/\s])ds4-server(\s|$)/.test(args);
+}
+
+async function findListeningDs4ServerPid(): Promise<number | undefined> {
+	const output = await execCapture("lsof", ["-nP", "-tiTCP:8000", "-sTCP:LISTEN"], 2_000);
+	for (const line of (output ?? "").split(/\r?\n/)) {
+		const pid = Number(line.trim());
+		if (Number.isInteger(pid) && isPidAlive(pid) && (await looksLikeDs4Server(pid))) return pid;
+	}
+	return undefined;
+}
+
+async function resolveWatchdogScript(runtimeDir: string): Promise<string> {
+	const script = join(runtimeDir, WATCHDOG_SCRIPT_NAME);
+	try {
+		await access(script, constants.F_OK);
+		return script;
+	} catch {
+		throw new Error(`Cannot find ${WATCHDOG_SCRIPT_NAME} in ds4 runtime checkout ${runtimeDir}`);
+	}
+}
+
+async function cleanupOldNodeWatchdogs(): Promise<void> {
+	const output = await execCapture("ps", ["axo", "pid=,args="], 2_000);
+	for (const line of (output ?? "").split(/\r?\n/)) {
+		const match = line.trim().match(/^(\d+)\s+(.*)$/);
+		if (!match) continue;
+		const pid = Number(match[1]);
+		const args = match[2] ?? "";
+		if (pid === process.pid || !args.includes("node -e") || !args.includes("ds4-watchdog")) continue;
+		try {
+			process.kill(pid, "SIGTERM");
+			await appendLog(`[${new Date().toISOString()}] stopped old node ds4-watchdog pid=${pid}\n`);
+		} catch {}
+	}
+	await removeFile(join(DS4_DIR, "watchdog.json"));
+}
+
+async function ensureWatchdog(runtimeDir: string): Promise<void> {
+	if (watchdogStarted) return;
+	await mkdir(DS4_DIR, { recursive: true });
+	await cleanupOldNodeWatchdogs();
+	const watchdogScript = await resolveWatchdogScript(runtimeDir);
+
+	const current = await readJson<{ pid?: number }>(WATCHDOG_PID_FILE);
+	const currentArgs = current?.pid && isPidAlive(current.pid) ? await processArgs(current.pid) : undefined;
+	if (current?.pid && currentArgs?.includes(watchdogScript) && currentArgs.includes(String(process.pid))) {
+		watchdogStarted = true;
+		return;
+	}
+
+	const logFd = openSync(LOG_FILE, "a");
+	try {
+		const child = spawn("/bin/sh", [watchdogScript, String(process.pid)], {
+			detached: true,
+			stdio: ["ignore", logFd, logFd],
+			env: {
+				...process.env,
+				DS4_DIR,
+				DS4_CLIENT_DIR: CLIENT_DIR,
+				DS4_STATE_FILE: STATE_FILE,
+				DS4_LOG_FILE: LOG_FILE,
+				DS4_BASE_URL: API_BASE_URL,
+				DS4_LEASE_TTL_S: String(Math.ceil(LEASE_TTL_MS / 1000)),
+				DS4_WATCHDOG_POLL_S: String(Math.max(1, Math.ceil(WATCHDOG_POLL_MS / 1000))),
+				DS4_SHUTDOWN_GRACE_S: String(Math.ceil(SHUTDOWN_GRACE_MS / 1000)),
+			},
+		});
+		child.unref();
+		watchdogStarted = true;
+		if (child.pid) {
+			await writeJsonAtomic(WATCHDOG_PID_FILE, {
+				managedBy: MANAGED_BY,
+				pid: child.pid,
+				parentPid: process.pid,
+				startedAt: Date.now(),
+				startedAtIso: new Date().toISOString(),
+			});
+		}
+	} finally {
+		closeSync(logFd);
+	}
+}
+
+async function writeAdoptedServerStateLocked(pid: number): Promise<void> {
+	const args = await processArgs(pid);
+	const now = Date.now();
+	const binary = args?.split(/\s+/, 1)[0] || "ds4-server";
+	const state: ServerState = {
+		managedBy: MANAGED_BY,
+		pid,
+		baseUrl: API_BASE_URL,
+		cwd: SUPPORT_DIR,
+		binary,
+		args: args ? [args] : [],
+		startedAt: now,
+		startedAtIso: new Date(now).toISOString(),
+	};
+	await writeJsonAtomic(STATE_FILE, state);
+	await appendLog(`\n[${new Date().toISOString()}] adopted existing ds4-server pid=${pid}\n`);
+}
+
 async function runLogged(command: string, args: string[], cwd: string, label: string): Promise<void> {
 	if (runtimeDisposed || shuttingDown) throw new Error(`${label} cancelled`);
 
@@ -505,8 +674,14 @@ async function ensureRuntimeReadyLocked(onStatus?: StatusCallback): Promise<stri
 }
 
 async function isLockStale(): Promise<boolean> {
-	const owner = await readJson<{ pid?: number }>(join(LOCK_DIR, "owner.json"));
-	if (owner?.pid) return !isPidAlive(owner.pid);
+	const owner = await readJson<{ pid?: number; processStart?: string }>(join(LOCK_DIR, "owner.json"));
+	if (owner?.pid) {
+		if (!isPidAlive(owner.pid)) return true;
+		if (owner.processStart) {
+			const currentStart = await processStart(owner.pid);
+			if (currentStart && currentStart !== owner.processStart) return true;
+		}
+	}
 
 	try {
 		const info = await stat(LOCK_DIR);
@@ -527,6 +702,7 @@ async function withLock<T>(fn: () => Promise<T>, timeoutMs = LOCK_TIMEOUT_MS, ab
 			await writeJsonAtomic(join(LOCK_DIR, "owner.json"), {
 				managedBy: MANAGED_BY,
 				pid: process.pid,
+				processStart: await getOwnProcessStart(),
 				createdAt: Date.now(),
 			});
 			break;
@@ -556,6 +732,7 @@ async function touchLease(): Promise<void> {
 		managedBy: MANAGED_BY,
 		usesDs4: true,
 		pid: process.pid,
+		processStart: await getOwnProcessStart(),
 		cwd: process.cwd(),
 		startedAt: leaseStartedAt,
 		updatedAt: now,
@@ -589,33 +766,18 @@ async function pruneLeases(): Promise<void> {
 		const file = join(CLIENT_DIR, entry);
 		const [lease, info] = await Promise.all([readJson<Lease>(file), stat(file).catch(() => undefined)]);
 		const staleByAge = !info || now - info.mtimeMs > LEASE_TTL_MS;
-		const staleByPid = !isPidAlive(lease?.pid);
-		const staleByVersion = lease?.managedBy !== MANAGED_BY || lease?.usesDs4 !== true;
-		if (staleByAge || staleByPid || staleByVersion) await removeFile(file);
+		const staleByProcess = !(await isLeaseForLiveProcess(lease));
+		if (staleByAge || staleByProcess) await removeFile(file);
 	}
 }
 
-async function activeLeaseCount(): Promise<number> {
-	await pruneLeases();
-	const entries = await readdir(CLIENT_DIR).catch(() => [] as string[]);
-	return entries.filter((entry) => entry.endsWith(".json")).length;
-}
-
-async function activateLease(): Promise<void> {
+async function activateLease(runtimeDir: string): Promise<void> {
 	await ensureDirs();
 	await touchLease();
 	leaseActive = true;
 	await pruneLeases();
+	await ensureWatchdog(runtimeDir);
 	startHeartbeat();
-}
-
-async function ownLeaseExists(): Promise<boolean> {
-	try {
-		await stat(LEASE_FILE);
-		return true;
-	} catch {
-		return false;
-	}
 }
 
 async function removeOwnLease(): Promise<void> {
@@ -719,26 +881,30 @@ async function startServerLocked(runtimeDir: string): Promise<void> {
 
 async function ensureServerManagedInner(onStatus?: StatusCallback): Promise<void> {
 	if (runtimeDisposed || shuttingDown) return;
-	await activateLease();
-	if (runtimeDisposed || shuttingDown) return;
-
 	let stoppingPid: number | undefined;
 
 	await withLock(async () => {
+		let runtimeDir = await resolveRuntimeDirLocked(onStatus);
+		await activateLease(runtimeDir);
+		if (runtimeDisposed || shuttingDown) return;
 		await touchLease();
 		await pruneLeases();
 
 		const state = await readState();
-		if (state?.pid && isPidAlive(state.pid)) {
+		if (state?.pid && isPidAlive(state.pid) && (await looksLikeDs4Server(state.pid))) {
 			if (state.stopping) stoppingPid = state.pid;
 			return;
 		}
 
 		if (state?.pid) await clearState();
-		if (await checkHttpReady()) return;
+		if (await checkHttpReady()) {
+			const pid = await findListeningDs4ServerPid();
+			if (pid) await writeAdoptedServerStateLocked(pid);
+			return;
+		}
 		if (runtimeDisposed || shuttingDown) return;
 
-		const runtimeDir = await ensureRuntimeReadyLocked(onStatus);
+		runtimeDir = await ensureRuntimeReadyLocked(onStatus);
 		if (runtimeDisposed || shuttingDown) return;
 
 		onStatus?.("starting ds4-server");
@@ -771,51 +937,11 @@ function ensureServerManaged(onStatus?: StatusCallback): Promise<void> {
 	return startupPromise;
 }
 
-async function signalManagedServerStopLocked(): Promise<number | undefined> {
-	const state = await readState();
-	if (!state || state.managedBy !== MANAGED_BY) return undefined;
-	if (!isPidAlive(state.pid)) {
-		await clearState();
-		return undefined;
-	}
-
-	const now = Date.now();
-	await writeJsonAtomic(STATE_FILE, {
-		...state,
-		stopping: true,
-		stoppingAt: now,
-		stoppingAtIso: new Date(now).toISOString(),
-	});
-
-	try {
-		process.kill(state.pid, "SIGTERM");
-		return state.pid;
-	} catch (error: any) {
-		if (error?.code === "ESRCH") {
-			await clearState();
-			return undefined;
-		}
-		throw error;
-	}
-}
-
 async function stopServerIfUnused(): Promise<void> {
-	let stoppingPid: number | undefined;
-
+	// The per-pi watchdog is responsible for refcounting all client leases and
+	// stopping ds4-server once this pi process has exited. Keep /quit fast and
+	// avoid duplicating shutdown races here.
 	await removeOwnLease();
-	await withLock(async () => {
-		await pruneLeases();
-		if ((await activeLeaseCount()) > 0) return;
-		stoppingPid = await signalManagedServerStopLocked();
-	}, SHUTDOWN_LOCK_TIMEOUT_MS);
-
-	if (!stoppingPid) return;
-
-	await waitForPidExit(stoppingPid, SHUTDOWN_GRACE_MS);
-	await withLock(async () => {
-		const state = await readState();
-		if (state?.pid === stoppingPid && !isPidAlive(stoppingPid)) await clearState();
-	}, SHUTDOWN_LOCK_TIMEOUT_MS);
 }
 
 function registerDs4Command(pi: ExtensionAPI): void {
@@ -895,6 +1021,7 @@ export default function (pi: ExtensionAPI) {
 	shuttingDown = false;
 	leaseStartedAt = Date.now();
 	leaseActive = false;
+	watchdogStarted = false;
 	startupPromise = undefined;
 	activeSetupChild = undefined;
 	resolvedRuntimeDir = undefined;
@@ -938,7 +1065,6 @@ export default function (pi: ExtensionAPI) {
 		// Session switches and /reload immediately create another extension instance
 		// in the same pi process. Keep the lease for those hand-offs.
 		if (event.reason !== "quit") return;
-		if (!leaseActive && !(await ownLeaseExists())) return;
 
 		shuttingDown = true;
 		try {

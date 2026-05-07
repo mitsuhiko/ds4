@@ -13,5 +13,10 @@
     "extensions": [
       "./pi-sd4-provider.ts"
     ]
-  }
+  },
+  "files": [
+    "pi-sd4-provider.ts",
+    "ds4-watchdog.sh",
+    "install-pi-extension-local.sh"
+  ]
 }
