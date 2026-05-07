@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { closeSync, constants, openSync } from "node:fs";
+import { closeSync, constants, openSync, writeSync } from "node:fs";
 import {
 	access,
 	appendFile,
@@ -51,6 +51,8 @@ const LOG_TAIL_BYTES = 256 * 1024;
 const LOG_MAX_LINES = 2_000;
 const LOG_POLL_MS = 1_000;
 const WATCHDOG_POLL_MS = 2_000;
+const PROGRESS_NOTIFY_MS = 750;
+const PROGRESS_MAX_CHARS = 160;
 
 type ModelQuant = "q2" | "q4";
 
@@ -80,6 +82,7 @@ type Lease = {
 };
 
 type StatusCallback = (message: string | undefined) => void;
+type RunLoggedOptions = { onStatus?: StatusCallback; progressPrefix?: string };
 
 type LogTui = { terminal: { rows: number }; requestRender: (force?: boolean) => void };
 type LogTheme = { fg: (color: string, text: string) => string };
@@ -529,13 +532,103 @@ async function writeAdoptedServerStateLocked(pid: number): Promise<void> {
 	await appendLog(`\n[${new Date().toISOString()}] adopted existing ds4-server pid=${pid}\n`);
 }
 
-async function runLogged(command: string, args: string[], cwd: string, label: string): Promise<void> {
+function formatCurlProgress(line: string): string | undefined {
+	const fields = line.trim().split(/\s+/);
+	if (fields.length < 12) return undefined;
+	if (!/^\d+(?:\.\d+)?$/.test(fields[0]) || !/^\d+(?:\.\d+)?$/.test(fields[2])) return undefined;
+
+	const total = fields[1];
+	const percent = fields[2];
+	const received = fields[3];
+	const left = fields[10];
+	const speed = fields[11];
+	if (!total || !received) return undefined;
+
+	const details = [`${percent}%`];
+	if (speed && speed !== "0") details.push(`${speed}/s`);
+	if (left && left !== "--:--:--") details.push(`${left} left`);
+	return `${received} / ${total} (${details.join(", ")})`;
+}
+
+function compactProgressLine(rawLine: string): string | undefined {
+	let line = stripAnsi(rawLine)
+		.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+	if (!line) return undefined;
+	if (/^% Total\b/.test(line) || /^Dload\s+Upload\b/.test(line)) return undefined;
+
+	line = formatCurlProgress(line) ?? line;
+	if (line.length > PROGRESS_MAX_CHARS) line = `${line.slice(0, PROGRESS_MAX_CHARS - 1)}…`;
+	return line;
+}
+
+function createProgressReporter(prefix: string, onStatus?: StatusCallback) {
+	let lineBuffer = "";
+	let latest: string | undefined;
+	let emitted: string | undefined;
+	let lastEmit = 0;
+
+	const maybeEmit = (force = false) => {
+		if (!onStatus || !latest || latest === emitted) return;
+		const now = Date.now();
+		if (!force && now - lastEmit < PROGRESS_NOTIFY_MS) return;
+		emitted = latest;
+		lastEmit = now;
+		onStatus(`${prefix}: ${latest}`);
+	};
+
+	const processLine = (line: string) => {
+		const progress = compactProgressLine(line);
+		if (!progress) return;
+		latest = progress;
+		maybeEmit(false);
+	};
+
+	const onChunk = (chunk: Buffer | string) => {
+		const text = chunk.toString();
+		let start = 0;
+		for (let i = 0; i < text.length; i++) {
+			const ch = text[i];
+			if (ch !== "\r" && ch !== "\n") continue;
+			processLine(lineBuffer + text.slice(start, i));
+			lineBuffer = "";
+			if (ch === "\r" && text[i + 1] === "\n") i++;
+			start = i + 1;
+		}
+		lineBuffer += text.slice(start);
+		if (lineBuffer.length > 4096) {
+			processLine(lineBuffer);
+			lineBuffer = "";
+		}
+	};
+
+	const flush = () => {
+		if (lineBuffer) {
+			processLine(lineBuffer);
+			lineBuffer = "";
+		}
+		maybeEmit(true);
+	};
+
+	return { onChunk, flush };
+}
+
+async function runLogged(command: string, args: string[], cwd: string, label: string, options: RunLoggedOptions = {}): Promise<void> {
 	if (runtimeDisposed || shuttingDown) throw new Error(`${label} cancelled`);
 
 	await appendLog(`\n[${new Date().toISOString()}] ${label}\n$ ${[command, ...args].map(shellQuote).join(" ")}\n`);
 
 	const logFd = openSync(LOG_FILE, "a");
+	const progress = options.progressPrefix ? createProgressReporter(options.progressPrefix, options.onStatus) : undefined;
 	let closed = false;
+	const writeLogChunk = (chunk: Buffer | string) => {
+		if (closed) return;
+		try {
+			if (typeof chunk === "string") writeSync(logFd, chunk);
+			else writeSync(logFd, chunk);
+		} catch {}
+	};
 	const closeLog = () => {
 		if (!closed) {
 			closed = true;
@@ -549,19 +642,27 @@ async function runLogged(command: string, args: string[], cwd: string, label: st
 			child = spawn(command, args, {
 				cwd,
 				detached: process.platform !== "win32",
-				stdio: ["ignore", logFd, logFd],
+				stdio: ["ignore", "pipe", "pipe"],
 				env: process.env,
 			});
 		} catch (error) {
+			progress?.flush();
 			closeLog();
 			reject(error);
 			return;
 		}
 
 		activeSetupChild = child;
+		const handleOutput = (chunk: Buffer) => {
+			writeLogChunk(chunk);
+			progress?.onChunk(chunk);
+		};
+		child.stdout?.on("data", handleOutput);
+		child.stderr?.on("data", handleOutput);
 
 		const finish = (error?: Error) => {
 			if (activeSetupChild === child) activeSetupChild = undefined;
+			progress?.flush();
 			closeLog();
 			if (error) reject(error);
 			else resolvePromise();
@@ -621,9 +722,10 @@ async function ensureSupportCheckout(onStatus?: StatusCallback): Promise<string>
 	await mkdir(DS4_DIR, { recursive: true });
 	await runLogged(
 		"git",
-		["clone", "--branch", SUPPORT_BRANCH, "--single-branch", "--depth", "1", SUPPORT_REPO, SUPPORT_DIR],
+		["clone", "--progress", "--branch", SUPPORT_BRANCH, "--single-branch", "--depth", "1", SUPPORT_REPO, SUPPORT_DIR],
 		DS4_DIR,
 		"clone ds4 support checkout",
+		{ onStatus, progressPrefix: "cloning ds4 support checkout" },
 	);
 
 	if (!(await isDs4Checkout(SUPPORT_DIR))) {
@@ -654,14 +756,20 @@ async function ensureBuilt(runtimeDir: string, onStatus?: StatusCallback): Promi
 	} catch {}
 
 	onStatus?.("building ds4-server");
-	await runLogged("make", ["ds4-server"], runtimeDir, "build ds4-server");
+	await runLogged("make", ["ds4-server"], runtimeDir, "build ds4-server", {
+		onStatus,
+		progressPrefix: "building ds4-server",
+	});
 	await access(join(runtimeDir, "ds4-server"), constants.X_OK);
 }
 
 async function ensureModel(runtimeDir: string, onStatus?: StatusCallback): Promise<void> {
 	const quant = selectedModelQuant();
 	onStatus?.(`ensuring ${quant} model`);
-	await runLogged("./download_model.sh", [quant], runtimeDir, `download ${quant} model`);
+	await runLogged("./download_model.sh", [quant], runtimeDir, `download ${quant} model`, {
+		onStatus,
+		progressPrefix: `ensuring ${quant} model`,
+	});
 }
 
 async function ensureRuntimeReadyLocked(onStatus?: StatusCallback): Promise<string> {

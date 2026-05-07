@@ -34,6 +34,9 @@ Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
 
+Downloads use the Hugging Face CLI (hf download) when available, which can
+be faster when authenticated. Otherwise the script falls back to curl.
+
 After q2/q4 downloads the script updates:
   ./ds4flash.gguf -> gguf/<selected model>
 
@@ -108,13 +111,23 @@ download_one() {
     echo "Downloading $file"
     echo "from https://huggingface.co/$REPO"
 
-    if [ -n "$TOKEN" ]; then
-        curl -fL -C - -H "Authorization: Bearer $TOKEN" -o "$part" "$url"
+    if command -v hf >/dev/null 2>&1; then
+        echo "using hf download"
+        if [ -n "$TOKEN" ]; then
+            hf download "$REPO" "$file" --local-dir "$OUT_DIR" --token "$TOKEN"
+        else
+            hf download "$REPO" "$file" --local-dir "$OUT_DIR"
+        fi
     else
-        curl -fL -C - -o "$part" "$url"
-    fi
+        echo "using curl"
+        if [ -n "$TOKEN" ]; then
+            curl -fL -C - -H "Authorization: Bearer $TOKEN" -o "$part" "$url"
+        else
+            curl -fL -C - -o "$part" "$url"
+        fi
 
-    mv "$part" "$out"
+        mv "$part" "$out"
+    fi
 }
 
 download_one "$MODEL_FILE"
