@@ -89,7 +89,6 @@ type LogTheme = { fg: (color: string, text: string) => string };
 type Component = { render(width: number): string[]; handleInput?(data: string): void; invalidate(): void };
 
 const WATCHDOG_SCRIPT_NAME = "ds4-watchdog.sh";
-const WATCHDOG_PID_FILE = join(DS4_DIR, `watchdog-${process.pid}.json`);
 
 let heartbeat: ReturnType<typeof setInterval> | undefined;
 let startupPromise: Promise<void> | undefined;
@@ -452,8 +451,17 @@ async function resolveWatchdogScript(runtimeDir: string): Promise<string> {
 	}
 }
 
+async function cleanupLegacyWatchdogStateFiles(): Promise<void> {
+	const entries = await readdir(DS4_DIR).catch(() => [] as string[]);
+	await Promise.all(
+		entries
+			.filter((entry) => /^watchdog(?:-\d+)?\.json$/.test(entry))
+			.map((entry) => removeFile(join(DS4_DIR, entry)).catch(() => {})),
+	);
+}
+
 async function cleanupOldNodeWatchdogs(): Promise<void> {
-	const output = await execCapture("ps", ["axo", "pid=,args="], 2_000);
+	const output = await execCapture("ps", ["axww", "-o", "pid=,args="], 2_000);
 	for (const line of (output ?? "").split(/\r?\n/)) {
 		const match = line.trim().match(/^(\d+)\s+(.*)$/);
 		if (!match) continue;
@@ -465,7 +473,20 @@ async function cleanupOldNodeWatchdogs(): Promise<void> {
 			await appendLog(`[${new Date().toISOString()}] stopped old node ds4-watchdog pid=${pid}\n`);
 		} catch {}
 	}
-	await removeFile(join(DS4_DIR, "watchdog.json"));
+	await cleanupLegacyWatchdogStateFiles();
+}
+
+async function hasRunningWatchdog(): Promise<boolean> {
+	const output = await execCapture("ps", ["axww", "-o", "pid=,args="], 2_000);
+	const invocation = `${WATCHDOG_SCRIPT_NAME} ${DS4_DIR}`;
+	for (const line of (output ?? "").split(/\r?\n/)) {
+		const match = line.trim().match(/^(\d+)\s+(.*)$/);
+		if (!match) continue;
+		const pid = Number(match[1]);
+		const args = match[2] ?? "";
+		if (pid !== process.pid && args.includes(invocation)) return true;
+	}
+	return false;
 }
 
 async function ensureWatchdog(runtimeDir: string): Promise<void> {
@@ -474,16 +495,14 @@ async function ensureWatchdog(runtimeDir: string): Promise<void> {
 	await cleanupOldNodeWatchdogs();
 	const watchdogScript = await resolveWatchdogScript(runtimeDir);
 
-	const current = await readJson<{ pid?: number }>(WATCHDOG_PID_FILE);
-	const currentArgs = current?.pid && isPidAlive(current.pid) ? await processArgs(current.pid) : undefined;
-	if (current?.pid && currentArgs?.includes(watchdogScript) && currentArgs.includes(String(process.pid))) {
+	if (await hasRunningWatchdog()) {
 		watchdogStarted = true;
 		return;
 	}
 
 	const logFd = openSync(LOG_FILE, "a");
 	try {
-		const child = spawn("/bin/sh", [watchdogScript, String(process.pid)], {
+		const child = spawn("/bin/sh", [watchdogScript, DS4_DIR], {
 			detached: true,
 			stdio: ["ignore", logFd, logFd],
 			env: {
@@ -500,15 +519,6 @@ async function ensureWatchdog(runtimeDir: string): Promise<void> {
 		});
 		child.unref();
 		watchdogStarted = true;
-		if (child.pid) {
-			await writeJsonAtomic(WATCHDOG_PID_FILE, {
-				managedBy: MANAGED_BY,
-				pid: child.pid,
-				parentPid: process.pid,
-				startedAt: Date.now(),
-				startedAtIso: new Date().toISOString(),
-			});
-		}
 	} finally {
 		closeSync(logFd);
 	}
@@ -1053,9 +1063,8 @@ function ensureServerManaged(onStatus?: StatusCallback): Promise<void> {
 }
 
 async function stopServerIfUnused(): Promise<void> {
-	// The per-pi watchdog is responsible for refcounting all client leases and
-	// stopping ds4-server once this pi process has exited. Keep /quit fast and
-	// avoid duplicating shutdown races here.
+	// The watchdog owns lease refcounting and server shutdown.  Keep /quit fast:
+	// removing our lease is enough for it to stop ds4-server when nobody else is using it.
 	await removeOwnLease();
 }
 

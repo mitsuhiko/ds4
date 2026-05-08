@@ -1,25 +1,29 @@
 #!/bin/sh
 set -u
 
-parent_pid=${1:-}
 managed_by="pi-sd4-provider"
-ds4_dir=${DS4_DIR:?}
-client_dir=${DS4_CLIENT_DIR:?}
-state_file=${DS4_STATE_FILE:?}
-log_file=${DS4_LOG_FILE:?}
-base_url=${DS4_BASE_URL:?}
+ds4_dir=${1:-${DS4_DIR:-}}
+
+if [ -z "$ds4_dir" ]; then
+  echo "ds4-watchdog: missing ds4 directory" >&2
+  exit 0
+fi
+
+client_dir=${DS4_CLIENT_DIR:-$ds4_dir/clients}
+state_file=${DS4_STATE_FILE:-$ds4_dir/server.json}
+log_file=${DS4_LOG_FILE:-$ds4_dir/log}
+base_url=${DS4_BASE_URL:-http://127.0.0.1:8000/v1}
 lease_ttl_s=${DS4_LEASE_TTL_S:-45}
 poll_s=${DS4_WATCHDOG_POLL_S:-2}
 shutdown_grace_s=${DS4_SHUTDOWN_GRACE_S:-60}
-own_lease="$client_dir/$parent_pid.json"
 
 log() {
   mkdir -p "$ds4_dir" 2>/dev/null || true
-  printf '[%s] ds4-watchdog(%s): %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$parent_pid" "$*" >> "$log_file" 2>/dev/null || true
+  printf '[%s] ds4-watchdog: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$log_file" 2>/dev/null || true
 }
 
 pid_alive() {
-  [ -n "$1" ] && kill -0 "$1" 2>/dev/null
+  [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null
 }
 
 mtime_sec() {
@@ -118,15 +122,29 @@ clear_state_if_dead() {
   fi
 }
 
-stop_server() {
+managed_server_pid() {
   pid=$(state_pid)
-  if [ -z "$pid" ] || ! pid_alive "$pid" || ! looks_like_ds4_server "$pid"; then
-    pid=$(find_ds4_server_pid || true)
+  if [ -n "$pid" ] && pid_alive "$pid" && looks_like_ds4_server "$pid"; then
+    echo "$pid"
+    return 0
   fi
+  find_ds4_server_pid
+}
+
+server_has_clients() {
+  pid=$(managed_server_pid || true)
+  [ -n "$pid" ] || return 1
+  command -v lsof >/dev/null 2>&1 || return 1
+  lsof -nP -a -p "$pid" -iTCP -sTCP:ESTABLISHED 2>/dev/null | awk 'NR > 1 { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+stop_server() {
+  pid=$(managed_server_pid || true)
 
   if [ -z "$pid" ]; then
-    log "no active ds4-server; exiting"
-    exit 0
+    rm -f "$state_file" 2>/dev/null || true
+    log "no active ds4-server"
+    return 0
   fi
 
   mark_stopping "$pid"
@@ -135,7 +153,7 @@ stop_server() {
   else
     log "SIGTERM failed for ds4-server pid=$pid"
     clear_state_if_dead "$pid"
-    exit 0
+    return 0
   fi
 
   waited=0
@@ -154,19 +172,24 @@ stop_server() {
   log "ds4-server pid=$pid stopped"
 }
 
-if [ -z "$parent_pid" ]; then
-  log "missing parent pid; exiting"
-  exit 0
-fi
+log "started for $ds4_dir"
+waiting_for_clients=0
+while :; do
+  if [ "$(active_lease_count)" -eq 0 ]; then
+    if server_has_clients; then
+      if [ "$waiting_for_clients" -eq 0 ]; then
+        log "no active ds4 leases, but ds4-server still has clients; waiting"
+        waiting_for_clients=1
+      fi
+      sleep "$poll_s"
+      continue
+    fi
 
-log "started for parent pid=$parent_pid"
-while pid_alive "$parent_pid"; do
+    log "no active ds4 leases; stopping server"
+    stop_server
+    log "exiting"
+    exit 0
+  fi
+  waiting_for_clients=0
   sleep "$poll_s"
 done
-
-rm -f "$own_lease" 2>/dev/null || true
-if [ "$(active_lease_count)" -eq 0 ]; then
-  stop_server
-else
-  log "parent exited; other ds4 leases still active"
-fi
