@@ -2976,7 +2976,7 @@ static void openai_stream_start(const request *r, openai_stream *st) {
     st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
 }
 
-static const char *find_any_tool_start(const char *s);
+static const char *find_any_tool_start_n(const char *s, size_t n);
 static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
                                      bool final);
@@ -3370,7 +3370,8 @@ static bool openai_sse_stream_update(int fd, const request *r, const char *id,
     }
 
     if (st->mode == OPENAI_STREAM_TEXT) {
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        const char *tool = (r->has_tools && raw_len > st->emit_pos) ?
+            find_any_tool_start_n(raw + st->emit_pos, raw_len - st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
 
@@ -3688,15 +3689,16 @@ static bool anthropic_sse_close_block_live(int fd, const char *id,
     return ok;
 }
 
-static const char *find_any_tool_start(const char *s) {
+static const char *find_any_tool_start_n(const char *s, size_t n) {
     const char *best = NULL;
-    const char *candidates[] = {
-        strstr(s, DS4_TOOL_CALLS_START),
-        strstr(s, DS4_TOOL_CALLS_START_SHORT),
-        strstr(s, "<tool_calls>"),
+    const char *markers[] = {
+        DS4_TOOL_CALLS_START,
+        DS4_TOOL_CALLS_START_SHORT,
+        "<tool_calls>",
     };
-    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
-        if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
+    for (size_t i = 0; i < sizeof(markers)/sizeof(markers[0]); i++) {
+        const char *p = find_lit_bounded(s, n, markers[i]);
+        if (p && (!best || p < best)) best = p;
     }
     return best;
 }
@@ -3708,7 +3710,7 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
 
     size_t limit = raw_len;
     if (has_tools) {
-        const char *tool = find_any_tool_start(raw + start);
+        const char *tool = find_any_tool_start_n(raw + start, raw_len - start);
         if (tool) {
             limit = trim_tool_separator_ws(raw, start, (size_t)(tool - raw));
             return utf8_stream_safe_len(raw, start, limit, true);
@@ -3797,7 +3799,8 @@ static bool anthropic_sse_stream_update(int fd, const request *r, const char *id
     }
 
     if (st->mode == ANTH_STREAM_TEXT) {
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        const char *tool = (r->has_tools && raw_len > st->emit_pos) ?
+            find_any_tool_start_n(raw + st->emit_pos, raw_len - st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
 
@@ -5142,6 +5145,14 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls) {
     buf_free(&names);
 }
 
+static const char *finish_after_parsed_tool_calls(const char *finish,
+                                                  const tool_calls *calls) {
+    if (calls && calls->len && (!finish || strcmp(finish, "error") != 0)) {
+        return "tool_calls";
+    }
+    return finish;
+}
+
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
     if (!p || !event || strcmp(event, "prefill_chunk")) return;
@@ -5625,7 +5636,7 @@ static void generate_job(server *s, job *j) {
                 snprintf(err, sizeof(err), "invalid tool call");
             }
         }
-        if (parsed_calls.len) final_finish = "tool_calls";
+        final_finish = finish_after_parsed_tool_calls(final_finish, &parsed_calls);
     }
     log_tool_calls_summary(ctx_span, &parsed_calls);
 
@@ -5634,7 +5645,9 @@ static void generate_job(server *s, job *j) {
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
-    if (j->req.kind == REQ_CHAT && parsed_calls.len) {
+    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+        strcmp(final_finish, "error") != 0)
+    {
         canonicalize_tool_checkpoint(s, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
@@ -6482,6 +6495,13 @@ static tool_schema_orders make_bash_order(void) {
     return orders;
 }
 
+static void test_parsed_tool_calls_do_not_override_error_finish(void) {
+    tool_calls calls = make_swapped_bash_call();
+    TEST_ASSERT(!strcmp(finish_after_parsed_tool_calls("error", &calls), "error"));
+    TEST_ASSERT(!strcmp(finish_after_parsed_tool_calls("stop", &calls), "tool_calls"));
+    tool_calls_free(&calls);
+}
+
 static char *read_socket_text(int fd) {
     buf b = {0};
     char tmp[1024];
@@ -6943,6 +6963,47 @@ static void test_openai_tool_stream_handles_multiple_calls(void) {
     TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
     TEST_ASSERT(strstr(out, "\\\"path\\\":") != NULL);
     TEST_ASSERT(strstr(out, "\\\"command\\\":") != NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_respects_raw_len_boundary(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *visible = "Visible";
+    const char *raw_prefix = "Visible" DS4_TOOL_CALLS_START;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_bound_tool", &st,
+                                         raw_prefix, strlen(visible), false));
+    TEST_ASSERT(st.mode == OPENAI_STREAM_TEXT);
+    TEST_ASSERT(st.emit_pos == strlen(visible));
+
+    const char *raw_full =
+        "Visible" DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_bound_tool", &st,
+                                         raw_full, strlen(raw_full), false));
+    TEST_ASSERT(st.mode == OPENAI_STREAM_TOOL);
+    TEST_ASSERT(st.tool.state == OPENAI_TOOL_BETWEEN_PARAMS);
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"content\":\"Visible\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
+    TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
 
     free(out);
     request_free(&r);
@@ -7629,6 +7690,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
+    test_parsed_tool_calls_do_not_override_error_finish();
     test_dsml_tool_args_are_schema_ordered();
     test_openai_tool_args_are_schema_ordered();
     test_anthropic_thinking_and_tool_args_are_schema_ordered();
@@ -7641,6 +7703,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_holds_partial_dsml_entities();
     test_openai_tool_stream_holds_partial_utf8_arguments();
     test_openai_tool_stream_handles_multiple_calls();
+    test_openai_tool_stream_respects_raw_len_boundary();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
