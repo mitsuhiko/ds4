@@ -1,7 +1,8 @@
 # ds4.c
 
 This repository is some slop patches by me on top of `ds4.c` to experiment
-with better streaming and an out-of-the-box experience for pi.
+with better streaming (can stream tool parameter calls) and an out-of-the-box
+experience for pi (downloads the model, compiles ds4, manages lifecycle).
 
 You can install this repository URL to get both the pi extension and `ds4`
 going: it downloads the model automatically, manages the server for you, and
